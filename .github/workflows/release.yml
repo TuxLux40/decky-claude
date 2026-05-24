@@ -1,0 +1,48 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 8
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Package plugin
+        run: |
+          mkdir -p out/decky-claude
+          cp -r dist plugin.json main.py LICENSE out/decky-claude/
+          cd out
+          zip -r decky-claude.zip decky-claude/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: decky-claude
+          path: out/decky-claude.zip
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/decky-claude.zip
+          generate_release_notes: true

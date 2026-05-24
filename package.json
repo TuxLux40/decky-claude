@@ -1,0 +1,28 @@
+{
+  "name": "decky-claude",
+  "version": "1.0.0",
+  "description": "Start Claude Code remote sessions from Gaming Mode",
+  "scripts": {
+    "build": "rollup -c",
+    "dev": "rollup -c --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "react-icons": "^5.0.0"
+  },
+  "devDependencies": {
+    "@decky/api": "*",
+    "@decky/ui": "*",
+    "@rollup/plugin-commonjs": "^25.0.0",
+    "@rollup/plugin-node-resolve": "^15.0.0",
+    "@rollup/plugin-replace": "^5.0.0",
+    "@rollup/plugin-typescript": "^11.0.0",
+    "rollup": "^3.29.0",
+    "tslib": "^2.6.0",
+    "typescript": "^5.3.0"
+  },
+  "peerDependencies": {
+    "react": "*",
+    "react-dom": "*"
+  }
+}
