@@ -123,8 +123,9 @@ Then restart the Decky plugin loader.
 
 ## Roadmap
 
-- [ ] Auto-trigger screenshot when a new message arrives in the session
-- [ ] Attach screenshot automatically to each new message as context
-- [ ] Game process list (detect which game is running)
+- [x] Screenshot on demand (MCP tool — Claude calls it automatically)
+- [x] Autonomous UI navigation via keyboard, mouse, text input (MCP tools)
+- [x] CLAUDE.md injection — instructs Claude to screenshot before answering game questions
+- [ ] Game process detection (identify which game is running)
 - [ ] Log file watcher (tail Steam / Proton logs into Claude's context)
 - [ ] Gamepad input via `ydotool` evdev events

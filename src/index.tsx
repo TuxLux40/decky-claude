@@ -3,7 +3,6 @@ import {
   DropdownItem,
   PanelSection,
   PanelSectionRow,
-  SliderField,
   staticClasses,
   ToggleField,
 } from "@decky/ui";
@@ -13,15 +12,22 @@ import { FaTerminal } from "react-icons/fa";
 
 // ── backend callables ──────────────────────────────────────────────────────────
 
-const startSession = callable<[string], { success: boolean; url?: string; error?: string }>("start_session");
+const startSession = callable<
+  [string],
+  { success: boolean; url?: string; error?: string }
+>("start_session");
 const stopSession = callable<[], { success: boolean }>("stop_session");
-const getStatus = callable<[], { status: string; url?: string; working_dir: string; error?: string }>("get_status");
+const getStatus = callable<
+  [],
+  { status: string; url?: string; working_dir: string; error?: string }
+>("get_status");
 const listDirs = callable<[], { dirs: string[] }>("list_dirs");
 
-const captureScreenshot = callable<[], { success: boolean; path?: string; thumbnail?: string; error?: string }>("capture_screenshot");
-const startAutoCapture = callable<[number], { success: boolean }>("start_auto_capture");
-const stopAutoCapture = callable<[], { success: boolean }>("stop_auto_capture");
-const getScreenState = callable<[], { auto_active: boolean; interval: number; thumbnail: string | null }>("get_screen_state");
+const captureScreenshot = callable<
+  [],
+  { success: boolean; path?: string; thumbnail?: string; error?: string }
+>("capture_screenshot");
+const getScreenState = callable<[], { thumbnail: string | null }>("get_screen_state");
 
 const sendKey = callable<[string], { success: boolean; error?: string }>("send_key");
 const sendText = callable<[string], { success: boolean; error?: string }>("send_text");
@@ -45,31 +51,7 @@ const QUICK_KEYS = [
   { label: "Tab", key: "Tab" },
 ];
 
-const INTERVAL_OPTIONS = [
-  { data: 5, label: "5 s" },
-  { data: 10, label: "10 s" },
-  { data: 30, label: "30 s" },
-  { data: 60, label: "60 s" },
-];
-
-// ── sub-components ─────────────────────────────────────────────────────────────
-
-function StatusDot({ color }: { color: string }) {
-  return (
-    <div
-      style={{
-        width: 10,
-        height: 10,
-        borderRadius: "50%",
-        background: color,
-        flexShrink: 0,
-        boxShadow: `0 0 6px ${color}`,
-      }}
-    />
-  );
-}
-
-// ── main component ─────────────────────────────────────────────────────────────
+// ── component ──────────────────────────────────────────────────────────────────
 
 function Content() {
   // session
@@ -83,8 +65,6 @@ function Content() {
 
   // screen
   const [thumbnail, setThumbnail] = useState<string | null>(null);
-  const [autoCapture, setAutoCapture] = useState(false);
-  const [captureInterval, setCaptureInterval] = useState(10);
   const [captureLoading, setCaptureLoading] = useState(false);
   const [captureError, setCaptureError] = useState<string | null>(null);
 
@@ -96,14 +76,9 @@ function Content() {
   useEffect(() => {
     listDirs().then((r) => setDirs(r.dirs));
     syncStatus();
-    getScreenState().then((r) => {
-      setAutoCapture(r.auto_active);
-      setCaptureInterval(r.interval);
-      if (r.thumbnail) setThumbnail(r.thumbnail);
-    });
+    getScreenState().then((r) => { if (r.thumbnail) setThumbnail(r.thumbnail); });
   }, []);
 
-  // ── status poll ──
   useEffect(() => {
     const id = setInterval(syncStatus, 3000);
     return () => clearInterval(id);
@@ -116,7 +91,7 @@ function Content() {
     if (r.error) setSessionError(r.error);
   }
 
-  // ── session handlers ──
+  // ── session ──
   async function handleStartSession() {
     setSessionLoading(true);
     setSessionError(null);
@@ -158,15 +133,15 @@ function Content() {
     setTimeout(() => setUrlCopied(false), 2000);
   }
 
-  // ── screen handlers ──
+  // ── screen ──
   async function handleCapture() {
     setCaptureLoading(true);
     setCaptureError(null);
     try {
       const r = await captureScreenshot();
-      if (r.success) {
-        if (r.thumbnail) setThumbnail(r.thumbnail);
-      } else {
+      if (r.success && r.thumbnail) {
+        setThumbnail(r.thumbnail);
+      } else if (!r.success) {
         setCaptureError(r.error ?? "Capture failed");
       }
     } finally {
@@ -174,27 +149,7 @@ function Content() {
     }
   }
 
-  async function handleAutoToggle(enabled: boolean) {
-    setAutoCapture(enabled);
-    if (enabled) {
-      await startAutoCapture(captureInterval);
-    } else {
-      await stopAutoCapture();
-    }
-    // Refresh thumbnail state
-    getScreenState().then((r) => {
-      if (r.thumbnail) setThumbnail(r.thumbnail);
-    });
-  }
-
-  async function handleIntervalChange(val: { data: number }) {
-    setCaptureInterval(val.data);
-    if (autoCapture) {
-      await startAutoCapture(val.data);
-    }
-  }
-
-  // ── input handlers ──
+  // ── input ──
   function showFeedback(msg: string, ok: boolean) {
     setInputFeedback({ msg, ok });
     setTimeout(() => setInputFeedback(null), 2000);
@@ -224,11 +179,17 @@ function Content() {
 
   return (
     <>
-      {/* ── Remote Session ── */}
+      {/* ── Remote Session ─────────────────────────────────────────────── */}
       <PanelSection title="Claude Code Remote">
         <PanelSectionRow>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <StatusDot color={statusColor} />
+            <div
+              style={{
+                width: 10, height: 10, borderRadius: "50%",
+                background: statusColor, flexShrink: 0,
+                boxShadow: `0 0 6px ${statusColor}`,
+              }}
+            />
             <span style={{ color: statusColor, fontWeight: 600 }}>{statusLabel}</span>
           </div>
         </PanelSectionRow>
@@ -236,17 +197,11 @@ function Content() {
         {sessionUrl && (
           <>
             <PanelSectionRow>
-              <div
-                style={{
-                  fontSize: 11,
-                  wordBreak: "break-all",
-                  color: "#5ba3f5",
-                  background: "rgba(91,163,245,0.08)",
-                  borderRadius: 6,
-                  padding: "6px 8px",
-                  lineHeight: 1.4,
-                }}
-              >
+              <div style={{
+                fontSize: 11, wordBreak: "break-all", color: "#5ba3f5",
+                background: "rgba(91,163,245,0.08)", borderRadius: 6,
+                padding: "6px 8px", lineHeight: 1.4,
+              }}>
                 {sessionUrl}
               </div>
             </PanelSectionRow>
@@ -257,7 +212,7 @@ function Content() {
             </PanelSectionRow>
             <PanelSectionRow>
               <div style={{ fontSize: 11, color: "#aaa" }}>
-                Open Claude app → Code tab → connect
+                Claude app → Code tab → connect. Claude will screenshot automatically when you ask about the game.
               </div>
             </PanelSectionRow>
           </>
@@ -271,16 +226,10 @@ function Content() {
 
         {sessionError && (
           <PanelSectionRow>
-            <div
-              style={{
-                fontSize: 11,
-                color: "#f44336",
-                wordBreak: "break-all",
-                background: "rgba(244,67,54,0.08)",
-                borderRadius: 6,
-                padding: "6px 8px",
-              }}
-            >
+            <div style={{
+              fontSize: 11, color: "#f44336", wordBreak: "break-all",
+              background: "rgba(244,67,54,0.08)", borderRadius: 6, padding: "6px 8px",
+            }}>
               {sessionError}
             </div>
           </PanelSectionRow>
@@ -314,15 +263,11 @@ function Content() {
           <PanelSectionRow>
             <div style={{ fontSize: 11, color: "#aaa", lineHeight: 1.6 }}>
               In Desktop Mode, run:
-              <code
-                style={{
-                  display: "block",
-                  marginTop: 4,
-                  background: "rgba(255,255,255,0.07)",
-                  borderRadius: 4,
-                  padding: "2px 6px",
-                }}
-              >
+              <code style={{
+                display: "block", marginTop: 4,
+                background: "rgba(255,255,255,0.07)",
+                borderRadius: 4, padding: "2px 6px",
+              }}>
                 npm install -g @anthropic-ai/claude-code
               </code>
             </div>
@@ -330,17 +275,15 @@ function Content() {
         )}
       </PanelSection>
 
-      {/* ── Screen Capture ── */}
-      <PanelSection title="Screen">
+      {/* ── Screen Preview ──────────────────────────────────────────────── */}
+      <PanelSection title="Screen Preview">
         {thumbnail && (
           <PanelSectionRow>
             <img
               src={`data:image/png;base64,${thumbnail}`}
               style={{
-                width: "100%",
-                borderRadius: 6,
+                width: "100%", borderRadius: 6, display: "block",
                 border: "1px solid rgba(255,255,255,0.1)",
-                display: "block",
               }}
               alt="Last capture"
             />
@@ -349,7 +292,7 @@ function Content() {
 
         <PanelSectionRow>
           <ButtonItem layout="below" onClick={handleCapture} disabled={captureLoading}>
-            {captureLoading ? "Capturing…" : "Capture Screen Now"}
+            {captureLoading ? "Capturing…" : "Capture Screen"}
           </ButtonItem>
         </PanelSectionRow>
 
@@ -360,49 +303,24 @@ function Content() {
         )}
 
         <PanelSectionRow>
-          <ToggleField
-            label="Auto-capture"
-            description={`Saves screen_latest.png every ${captureInterval} s`}
-            checked={autoCapture}
-            onChange={handleAutoToggle}
-          />
-        </PanelSectionRow>
-
-        {autoCapture && (
-          <PanelSectionRow>
-            <DropdownItem
-              label="Interval"
-              rgOptions={INTERVAL_OPTIONS}
-              selectedOption={captureInterval}
-              onChange={handleIntervalChange}
-            />
-          </PanelSectionRow>
-        )}
-
-        <PanelSectionRow>
-          <div style={{ fontSize: 11, color: "#666" }}>
-            Screenshots saved to your working directory — Claude can read them directly
+          <div style={{ fontSize: 11, color: "#555" }}>
+            Claude captures automatically when you message it. This button is for your own preview.
           </div>
         </PanelSectionRow>
       </PanelSection>
 
-      {/* ── Input ── */}
-      <PanelSection title="Input">
+      {/* ── Manual Input ────────────────────────────────────────────────── */}
+      <PanelSection title="Manual Input">
         <PanelSectionRow>
-          <div
-            style={{
-              fontSize: 11,
-              color: "#f0a500",
-              background: "rgba(240,165,0,0.08)",
-              borderRadius: 6,
-              padding: "5px 8px",
-            }}
-          >
+          <div style={{
+            fontSize: 11, color: "#f0a500",
+            background: "rgba(240,165,0,0.08)",
+            borderRadius: 6, padding: "5px 8px",
+          }}>
             ⚠ Input goes directly to the focused app
           </div>
         </PanelSectionRow>
 
-        {/* quick keys */}
         <PanelSectionRow>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
             {QUICK_KEYS.map(({ label, key }) => (
@@ -412,12 +330,9 @@ function Content() {
                 style={{
                   background: "rgba(255,255,255,0.1)",
                   border: "1px solid rgba(255,255,255,0.2)",
-                  borderRadius: 6,
-                  color: "#fff",
-                  padding: "4px 10px",
-                  fontSize: 12,
-                  cursor: "pointer",
-                  flex: "1 1 auto",
+                  borderRadius: 6, color: "#fff",
+                  padding: "4px 10px", fontSize: 12,
+                  cursor: "pointer", flex: "1 1 auto",
                 }}
               >
                 {label}
@@ -426,34 +341,28 @@ function Content() {
           </div>
         </PanelSectionRow>
 
-        {/* mouse buttons */}
         <PanelSectionRow>
           <div style={{ display: "flex", gap: 6 }}>
-            {[
-              { label: "Left Click", btn: 1 },
-              { label: "Right Click", btn: 3 },
-            ].map(({ label, btn }) => (
-              <button
-                key={btn}
-                onClick={() => handleClick(btn)}
-                style={{
-                  background: "rgba(255,255,255,0.1)",
-                  border: "1px solid rgba(255,255,255,0.2)",
-                  borderRadius: 6,
-                  color: "#fff",
-                  padding: "4px 10px",
-                  fontSize: 12,
-                  cursor: "pointer",
-                  flex: 1,
-                }}
-              >
-                {label}
-              </button>
-            ))}
+            {[{ label: "Left Click", btn: 1 }, { label: "Right Click", btn: 3 }].map(
+              ({ label, btn }) => (
+                <button
+                  key={btn}
+                  onClick={() => handleClick(btn)}
+                  style={{
+                    background: "rgba(255,255,255,0.1)",
+                    border: "1px solid rgba(255,255,255,0.2)",
+                    borderRadius: 6, color: "#fff",
+                    padding: "4px 10px", fontSize: 12,
+                    cursor: "pointer", flex: 1,
+                  }}
+                >
+                  {label}
+                </button>
+              )
+            )}
           </div>
         </PanelSectionRow>
 
-        {/* text input */}
         <PanelSectionRow>
           <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
             <input
@@ -466,10 +375,8 @@ function Content() {
                 flex: 1,
                 background: "rgba(255,255,255,0.07)",
                 border: "1px solid rgba(255,255,255,0.2)",
-                borderRadius: 6,
-                color: "#fff",
-                padding: "5px 8px",
-                fontSize: 12,
+                borderRadius: 6, color: "#fff",
+                padding: "5px 8px", fontSize: 12,
               }}
             />
             <button
@@ -478,10 +385,8 @@ function Content() {
               style={{
                 background: typeText ? "rgba(91,163,245,0.3)" : "rgba(255,255,255,0.05)",
                 border: "1px solid rgba(91,163,245,0.4)",
-                borderRadius: 6,
-                color: "#fff",
-                padding: "5px 12px",
-                fontSize: 12,
+                borderRadius: 6, color: "#fff",
+                padding: "5px 12px", fontSize: 12,
                 cursor: typeText ? "pointer" : "default",
               }}
             >
@@ -492,13 +397,10 @@ function Content() {
 
         {inputFeedback && (
           <PanelSectionRow>
-            <div
-              style={{
-                fontSize: 11,
-                color: inputFeedback.ok ? "#4caf50" : "#f44336",
-                padding: "2px 0",
-              }}
-            >
+            <div style={{
+              fontSize: 11,
+              color: inputFeedback.ok ? "#4caf50" : "#f44336",
+            }}>
               {inputFeedback.msg}
             </div>
           </PanelSectionRow>

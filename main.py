@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import glob
+import json
 import logging
 import os
 import re
@@ -10,7 +11,41 @@ logger = logging.getLogger("decky-claude")
 _ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _URL_PATTERN = re.compile(r"https://claude\.ai/code/session_[A-Za-z0-9_-]+")
 
-# xdotool key name → ydotool KEY_ name
+# Sentinel used to mark the block we inject into CLAUDE.md
+_MD_START = "<!-- decky-claude-start -->"
+_MD_END = "<!-- decky-claude-end -->"
+
+_CLAUDE_MD_BLOCK = f"""\
+{_MD_START}
+# Steam Deck Gaming Mode — decky-claude session
+
+You are running via the decky-claude Decky Loader plugin on a Steam Deck.
+The user is in Gaming Mode and is messaging you from the Claude Android app.
+
+## MCP tools you have
+
+- **screenshot** — Capture the current display (game, menu, error dialog).
+  Returns a PNG image so you can see exactly what the user sees.
+- **send_key** — Send a key press to the focused window
+  (e.g. `escape`, `Return`, `space`, `Tab`, `F1`, `ctrl+c`).
+- **type_text** — Type a string into the focused window.
+- **mouse_move_click** — Move to (x, y) pixel coordinates and click.
+  Steam Deck native resolution is 1280×800.
+
+## Behaviour rules
+
+1. **For any question about the game** (puzzles, mechanics, what's on screen,
+   crashes, launch failures): call `screenshot` first, then answer based on
+   what you see. Never guess — look first.
+2. **For debugging**: take a screenshot to see the current visual state, read
+   relevant log files (e.g. `~/.steam/logs/`, `~/.local/share/Steam/logs/`,
+   Proton logs), and use the input tools to navigate dialogs or menus as needed.
+3. **After sending input**: take another screenshot to confirm the result.
+4. You have both the terminal view (files, logs, commands) and the visual view
+   (screenshots). Use both together.
+{_MD_END}
+"""
+
 _KEY_MAP: dict[str, str] = {
     "escape": "KEY_ESC",
     "Return": "KEY_ENTER",
@@ -34,10 +69,7 @@ class Plugin:
     _error_msg: str | None = None
     _log_lines: list[str] = []
 
-    # ── screen capture state ───────────────────────────────────────────────────
-    _auto_task: asyncio.Task | None = None
-    _auto_active: bool = False
-    _auto_interval: int = 10
+    # ── screen state ───────────────────────────────────────────────────────────
     _last_thumb_b64: str | None = None
 
     # ── lifecycle ──────────────────────────────────────────────────────────────
@@ -47,7 +79,6 @@ class Plugin:
         self._log_lines = []
 
     async def _unload(self):
-        await self.stop_auto_capture(self)
         await self.stop_session(self)
 
     # ── session API ────────────────────────────────────────────────────────────
@@ -69,6 +100,8 @@ class Plugin:
                 "claude not found. Install via: npm install -g @anthropic-ai/claude-code"
             )
             return {"success": False, "error": self._error_msg}
+
+        self._setup_working_dir(working_dir)
 
         env = {**os.environ, **self._display_env()}
         try:
@@ -116,6 +149,8 @@ class Plugin:
             except ProcessLookupError:
                 pass
             self._process = None
+
+        self._cleanup_working_dir(self._working_dir)
         self._session_url = None
         self._status = "stopped"
         self._error_msg = None
@@ -149,45 +184,22 @@ class Plugin:
             pass
         return {"dirs": dirs}
 
-    # ── screenshot API ─────────────────────────────────────────────────────────
+    # ── screenshot API (for panel preview only) ────────────────────────────────
 
     async def capture_screenshot(self):
-        """Take a screenshot, save to working_dir/screen.png, return thumbnail."""
-        out_path = os.path.join(self._working_dir, "screen.png")
+        """Manual capture for the panel thumbnail — Claude uses the MCP tool instead."""
+        out_path = "/tmp/decky-claude-preview.png"
         result = await self._take_screenshot(out_path)
         if result["success"]:
             self._last_thumb_b64 = await self._make_thumb(out_path)
         return {**result, "thumbnail": self._last_thumb_b64}
 
-    async def start_auto_capture(self, interval: int = 10):
-        await self.stop_auto_capture(self)
-        self._auto_interval = interval
-        self._auto_active = True
-        self._auto_task = asyncio.ensure_future(self._capture_loop())
-        return {"success": True}
-
-    async def stop_auto_capture(self):
-        self._auto_active = False
-        if self._auto_task:
-            self._auto_task.cancel()
-            try:
-                await self._auto_task
-            except asyncio.CancelledError:
-                pass
-            self._auto_task = None
-        return {"success": True}
-
     async def get_screen_state(self):
-        return {
-            "auto_active": self._auto_active,
-            "interval": self._auto_interval,
-            "thumbnail": self._last_thumb_b64,
-        }
+        return {"thumbnail": self._last_thumb_b64}
 
-    # ── input API ──────────────────────────────────────────────────────────────
+    # ── input API (manual controls in the panel) ───────────────────────────────
 
     async def send_key(self, key: str):
-        """Press a key. key = xdotool name: 'escape', 'Return', 'space', etc."""
         env = self._display_env()
         r = await self._run_cmd(["xdotool", "key", "--clearmodifiers", key], env)
         if r["success"]:
@@ -196,40 +208,120 @@ class Plugin:
         return await self._run_cmd(["ydotool", "key", ydokey], env)
 
     async def send_text(self, text: str):
-        """Type a string into the focused window."""
         env = self._display_env()
-        r = await self._run_cmd(["xdotool", "type", "--clearmodifiers", "--", text], env)
+        r = await self._run_cmd(
+            ["xdotool", "type", "--clearmodifiers", "--delay", "20", "--", text], env
+        )
         if r["success"]:
             return r
         return await self._run_cmd(["ydotool", "type", "--", text], env)
 
     async def send_mouse_click(self, button: int = 1):
-        """Click a mouse button (1=left, 2=middle, 3=right)."""
         env = self._display_env()
         r = await self._run_cmd(["xdotool", "click", str(button)], env)
         if r["success"]:
             return r
-        # ydotool button codes: left=0xC0, right=0xC1, middle=0xC2
         btn_code = {1: "0xC0", 3: "0xC1", 2: "0xC2"}.get(button, "0xC0")
         return await self._run_cmd(["ydotool", "click", btn_code], env)
 
+    # ── working-dir setup / teardown ───────────────────────────────────────────
+
+    def _setup_working_dir(self, working_dir: str) -> None:
+        """Write .claude/mcp.json and inject our block into CLAUDE.md."""
+        claude_dir = os.path.join(working_dir, ".claude")
+        os.makedirs(claude_dir, exist_ok=True)
+
+        # MCP server config — points to mcp_server.py next to this file
+        plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        mcp_server = os.path.join(plugin_dir, "mcp_server.py")
+        mcp_config_path = os.path.join(claude_dir, "mcp.json")
+
+        existing_mcp: dict = {}
+        if os.path.exists(mcp_config_path):
+            try:
+                with open(mcp_config_path) as f:
+                    existing_mcp = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        servers = existing_mcp.setdefault("mcpServers", {})
+        servers["steamdeck"] = {
+            "command": "python3",
+            "args": [mcp_server],
+        }
+        with open(mcp_config_path, "w") as f:
+            json.dump(existing_mcp, f, indent=2)
+
+        # CLAUDE.md — append our block (idempotent)
+        md_path = os.path.join(working_dir, "CLAUDE.md")
+        existing_md = ""
+        if os.path.exists(md_path):
+            with open(md_path) as f:
+                existing_md = f.read()
+
+        if _MD_START not in existing_md:
+            with open(md_path, "a") as f:
+                if existing_md and not existing_md.endswith("\n"):
+                    f.write("\n")
+                f.write("\n" + _CLAUDE_MD_BLOCK)
+
+    def _cleanup_working_dir(self, working_dir: str) -> None:
+        """Remove the steamdeck MCP entry and our CLAUDE.md block."""
+        if not working_dir:
+            return
+
+        # Clean mcp.json
+        mcp_config_path = os.path.join(working_dir, ".claude", "mcp.json")
+        if os.path.exists(mcp_config_path):
+            try:
+                with open(mcp_config_path) as f:
+                    cfg = json.load(f)
+                cfg.get("mcpServers", {}).pop("steamdeck", None)
+                if cfg.get("mcpServers"):
+                    with open(mcp_config_path, "w") as f:
+                        json.dump(cfg, f, indent=2)
+                else:
+                    os.unlink(mcp_config_path)
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # Clean CLAUDE.md block
+        md_path = os.path.join(working_dir, "CLAUDE.md")
+        if os.path.exists(md_path):
+            try:
+                with open(md_path) as f:
+                    content = f.read()
+                start = content.find("\n" + _MD_START)
+                if start == -1:
+                    start = content.find(_MD_START)
+                end = content.find(_MD_END)
+                if start != -1 and end != -1:
+                    cleaned = content[:start] + content[end + len(_MD_END):]
+                    cleaned = cleaned.rstrip() + "\n" if cleaned.strip() else ""
+                    if cleaned.strip():
+                        with open(md_path, "w") as f:
+                            f.write(cleaned)
+                    else:
+                        os.unlink(md_path)
+            except OSError:
+                pass
+
     # ── private helpers ────────────────────────────────────────────────────────
 
-    def _display_env(self) -> dict:
+    def _display_env(self) -> dict[str, str]:
         env: dict[str, str] = {}
         env["XDG_RUNTIME_DIR"] = "/run/user/1000"
         for wd in ["wayland-0", "wayland-1", "wayland-2"]:
             if os.path.exists(f"/run/user/1000/{wd}"):
                 env["WAYLAND_DISPLAY"] = wd
                 break
-        for xd in [":0", ":1"]:
-            env.setdefault("DISPLAY", xd)
+        env.setdefault("DISPLAY", ":0")
         return env
 
     async def _take_screenshot(self, out_path: str) -> dict:
         env = {**os.environ, **self._display_env()}
         for cmd in [
-            ["grim", "-s", "1", out_path],
+            ["grim", out_path],
             ["scrot", out_path],
             ["import", "-window", "root", out_path],
         ]:
@@ -239,32 +331,18 @@ class Plugin:
         return {"success": False, "error": "No screenshot tool available (grim/scrot/import)"}
 
     async def _make_thumb(self, src: str) -> str | None:
-        """Return base64 of a ~30% scaled thumbnail, falling back to the original."""
         thumb = src.replace(".png", "_thumb.png")
         env = {**os.environ, **self._display_env()}
-        # Try grim at 30% scale, then ImageMagick, then raw full image
-        for cmd in [
-            ["grim", "-s", "0.3", thumb],
-            ["convert", "-resize", "30%", src, thumb],
-        ]:
+        for cmd in [["grim", "-s", "0.3", thumb], ["convert", "-resize", "30%", src, thumb]]:
             r = await self._run_cmd(cmd, env)
             if r["success"] and os.path.exists(thumb):
                 src = thumb
                 break
         try:
             with open(src, "rb") as f:
-                raw = f.read(512 * 1024)  # cap at 512 KB
-            return base64.b64encode(raw).decode()
+                return base64.b64encode(f.read(512 * 1024)).decode()
         except OSError:
             return None
-
-    async def _capture_loop(self):
-        while self._auto_active:
-            out_path = os.path.join(self._working_dir, "screen_latest.png")
-            result = await self._take_screenshot(out_path)
-            if result["success"]:
-                self._last_thumb_b64 = await self._make_thumb(out_path)
-            await asyncio.sleep(self._auto_interval)
 
     async def _run_cmd(self, cmd: list, env: dict | None = None) -> dict:
         try:
@@ -297,13 +375,12 @@ class Plugin:
                     return path
         except OSError:
             pass
-        candidates = [
+        for path in [
             "/home/deck/.local/share/pnpm/claude",
             "/home/deck/.local/bin/claude",
             "/usr/local/bin/claude",
             "/usr/bin/claude",
-        ] + glob.glob("/home/deck/.nvm/versions/node/*/bin/claude")
-        for path in candidates:
+        ] + glob.glob("/home/deck/.nvm/versions/node/*/bin/claude"):
             if os.path.isfile(path) and os.access(path, os.X_OK):
                 return path
         return None
