@@ -17,6 +17,8 @@
     "@rollup/plugin-node-resolve": "^15.0.0",
     "@rollup/plugin-replace": "^5.0.0",
     "@rollup/plugin-typescript": "^11.0.0",
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
     "rollup": "^3.29.0",
     "tslib": "^2.6.0",
     "typescript": "^5.3.0"

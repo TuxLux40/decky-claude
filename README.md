@@ -69,6 +69,17 @@ Steam Deck — Gaming Mode
 | Auto-capture | asyncio loop | Keeps `screen_latest.png` fresh |
 | Keyboard/mouse | `xdotool` → `ydotool` | Lets Claude navigate UI |
 | File access | Working directory | Logs, configs, saves |
+| Skill autoload | `~/.claude/skills/steam-debugger` | Loaded into every session |
+
+### Steam-debugger skill autoload
+
+If a skill whose folder name contains *steam* and *debug* (e.g.
+`steam-debugger`) exists under `~/.claude/skills/`, the plugin symlinks it
+into the session working directory (`.claude/skills/`) and instructs Claude —
+via the injected `CLAUDE.md` block — to invoke it at the start of the session,
+before any Steam/game debugging work. The panel shows whether the skill was
+found. The symlink and all injected config are removed again when the session
+stops.
 
 ---
 
@@ -126,6 +137,7 @@ Then restart the Decky plugin loader.
 - [x] Screenshot on demand (MCP tool — Claude calls it automatically)
 - [x] Autonomous UI navigation via keyboard, mouse, text input (MCP tools)
 - [x] CLAUDE.md injection — instructs Claude to screenshot before answering game questions
+- [x] steam-debugger skill autoload (`~/.claude/skills/steam-debugger`)
 - [ ] Game process detection (identify which game is running)
 - [ ] Log file watcher (tail Steam / Proton logs into Claude's context)
 - [ ] Gamepad input via `ydotool` evdev events

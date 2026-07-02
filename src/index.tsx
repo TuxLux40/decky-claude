@@ -19,7 +19,7 @@ const startSession = callable<
 const stopSession = callable<[], { success: boolean }>("stop_session");
 const getStatus = callable<
   [],
-  { status: string; url?: string; working_dir: string; error?: string }
+  { status: string; url?: string; working_dir: string; error?: string; skill?: string | null }
 >("get_status");
 const listDirs = callable<[], { dirs: string[] }>("list_dirs");
 
@@ -62,6 +62,7 @@ function Content() {
   const [sessionLoading, setSessionLoading] = useState(false);
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [urlCopied, setUrlCopied] = useState(false);
+  const [skill, setSkill] = useState<string | null>(null);
 
   // screen
   const [thumbnail, setThumbnail] = useState<string | null>(null);
@@ -88,6 +89,7 @@ function Content() {
     const r = await getStatus();
     setStatus(r.status as SessionStatus);
     setSessionUrl(r.url ?? null);
+    setSkill(r.skill ?? null);
     if (r.error) setSessionError(r.error);
   }
 
@@ -193,6 +195,16 @@ function Content() {
             <span style={{ color: statusColor, fontWeight: 600 }}>{statusLabel}</span>
           </div>
         </PanelSectionRow>
+
+        {isRunning && (
+          <PanelSectionRow>
+            <div style={{ fontSize: 11, color: skill ? "#4caf50" : "#f0a500" }}>
+              {skill
+                ? `Skill loaded: ${skill}`
+                : "steam-debugger skill not found (~/.claude/skills)"}
+            </div>
+          </PanelSectionRow>
+        )}
 
         {sessionUrl && (
           <>
@@ -413,6 +425,7 @@ function Content() {
 // ── plugin entry ───────────────────────────────────────────────────────────────
 
 export default definePlugin(() => ({
+  name: "Claude Code",
   title: <div className={staticClasses.Title}>Claude Code</div>,
   icon: <FaTerminal />,
   content: <Content />,

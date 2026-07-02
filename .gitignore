@@ -3,3 +3,4 @@ dist/
 out/
 *.zip
 .pnpm-store/
+__pycache__/

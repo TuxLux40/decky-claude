@@ -15,13 +15,31 @@ _URL_PATTERN = re.compile(r"https://claude\.ai/code/session_[A-Za-z0-9_-]+")
 _MD_START = "<!-- decky-claude-start -->"
 _MD_END = "<!-- decky-claude-end -->"
 
-_CLAUDE_MD_BLOCK = f"""\
+# Directories scanned for the user's steam-debugger skill
+_SKILL_BASES = [
+    os.path.expanduser("~/.claude/skills"),
+    "/home/deck/.claude/skills",
+]
+
+
+def _claude_md_block(skill_name: str | None) -> str:
+    skill_section = ""
+    if skill_name:
+        skill_section = f"""
+## Steam debugger skill — load it first
+
+The user's `{skill_name}` skill is installed for this session
+(`.claude/skills/{skill_name}`). BLOCKING REQUIREMENT: invoke the
+`{skill_name}` skill via the Skill tool at the start of the session, before
+doing any Steam or game debugging work, and follow its instructions.
+"""
+    return f"""\
 {_MD_START}
 # Steam Deck Gaming Mode — decky-claude session
 
 You are running via the decky-claude Decky Loader plugin on a Steam Deck.
 The user is in Gaming Mode and is messaging you from the Claude Android app.
-
+{skill_section}
 ## MCP tools you have
 
 - **screenshot** — Capture the current display (game, menu, error dialog).
@@ -68,6 +86,8 @@ class Plugin:
     _working_dir: str = "/home/deck"
     _error_msg: str | None = None
     _log_lines: list[str] = []
+    _skill_name: str | None = None
+    _skill_link_created: str | None = None
 
     # ── screen state ───────────────────────────────────────────────────────────
     _last_thumb_b64: str | None = None
@@ -79,7 +99,7 @@ class Plugin:
         self._log_lines = []
 
     async def _unload(self):
-        await self.stop_session(self)
+        await self.stop_session()
 
     # ── session API ────────────────────────────────────────────────────────────
 
@@ -101,12 +121,12 @@ class Plugin:
             )
             return {"success": False, "error": self._error_msg}
 
-        self._setup_working_dir(working_dir)
+        mcp_config = self._setup_working_dir(working_dir)
 
         env = {**os.environ, **self._display_env()}
         try:
             self._process = await asyncio.create_subprocess_exec(
-                claude_bin, "--rc",
+                claude_bin, "--rc", "--mcp-config", mcp_config,
                 cwd=working_dir,
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
@@ -167,6 +187,7 @@ class Plugin:
             "url": self._session_url,
             "working_dir": self._working_dir,
             "error": self._error_msg,
+            "skill": self._skill_name,
         }
 
     async def get_log(self):
@@ -226,15 +247,18 @@ class Plugin:
 
     # ── working-dir setup / teardown ───────────────────────────────────────────
 
-    def _setup_working_dir(self, working_dir: str) -> None:
-        """Write .claude/mcp.json and inject our block into CLAUDE.md."""
+    def _setup_working_dir(self, working_dir: str) -> str:
+        """Write .mcp.json, link the steam-debugger skill, inject our CLAUDE.md
+        block. Returns the path of the MCP config to pass via --mcp-config."""
         claude_dir = os.path.join(working_dir, ".claude")
         os.makedirs(claude_dir, exist_ok=True)
 
-        # MCP server config — points to mcp_server.py next to this file
+        # MCP server config — points to mcp_server.py next to this file.
+        # Written to .mcp.json (project scope) and also passed explicitly via
+        # --mcp-config so no trust prompt can block the headless session.
         plugin_dir = os.path.dirname(os.path.abspath(__file__))
         mcp_server = os.path.join(plugin_dir, "mcp_server.py")
-        mcp_config_path = os.path.join(claude_dir, "mcp.json")
+        mcp_config_path = os.path.join(working_dir, ".mcp.json")
 
         existing_mcp: dict = {}
         if os.path.exists(mcp_config_path):
@@ -252,6 +276,8 @@ class Plugin:
         with open(mcp_config_path, "w") as f:
             json.dump(existing_mcp, f, indent=2)
 
+        self._setup_skill(working_dir)
+
         # CLAUDE.md — append our block (idempotent)
         md_path = os.path.join(working_dir, "CLAUDE.md")
         existing_md = ""
@@ -263,15 +289,70 @@ class Plugin:
             with open(md_path, "a") as f:
                 if existing_md and not existing_md.endswith("\n"):
                     f.write("\n")
-                f.write("\n" + _CLAUDE_MD_BLOCK)
+                f.write("\n" + _claude_md_block(self._skill_name))
+
+        return mcp_config_path
+
+    # ── steam-debugger skill autoload ──────────────────────────────────────────
+
+    def _find_steam_debugger_skill(self) -> str | None:
+        """Locate the user's steam-debugger skill under ~/.claude/skills."""
+        seen: set[str] = set()
+        for base in _SKILL_BASES:
+            base = os.path.realpath(base)
+            if base in seen or not os.path.isdir(base):
+                continue
+            seen.add(base)
+            try:
+                entries = sorted(os.listdir(base))
+            except OSError:
+                continue
+            for entry in entries:
+                norm = entry.lower().replace("-", "").replace("_", "")
+                if "steam" in norm and "debug" in norm:
+                    path = os.path.join(base, entry)
+                    if os.path.isfile(os.path.join(path, "SKILL.md")):
+                        return path
+        return None
+
+    def _setup_skill(self, working_dir: str) -> None:
+        """Symlink the steam-debugger skill into the session's .claude/skills
+        so Claude discovers it regardless of working directory."""
+        self._skill_name = None
+        self._skill_link_created = None
+
+        src = self._find_steam_debugger_skill()
+        if not src:
+            logger.warning("steam-debugger skill not found in %s", _SKILL_BASES)
+            return
+
+        name = os.path.basename(src)
+        dest = os.path.join(working_dir, ".claude", "skills", name)
+        if os.path.realpath(dest) == os.path.realpath(src):
+            self._skill_name = name
+            if os.path.islink(dest):
+                # Symlink from a previous session — track it for cleanup
+                self._skill_link_created = dest
+            # else: working dir already contains the real skill (e.g. /home/deck)
+            return
+
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            if not os.path.exists(dest):
+                os.symlink(src, dest)
+                self._skill_link_created = dest
+            self._skill_name = name
+            logger.info("steam-debugger skill linked: %s -> %s", dest, src)
+        except OSError as exc:
+            logger.error("failed to link skill %s: %s", src, exc)
 
     def _cleanup_working_dir(self, working_dir: str) -> None:
-        """Remove the steamdeck MCP entry and our CLAUDE.md block."""
+        """Remove the steamdeck MCP entry, skill symlink and CLAUDE.md block."""
         if not working_dir:
             return
 
-        # Clean mcp.json
-        mcp_config_path = os.path.join(working_dir, ".claude", "mcp.json")
+        # Clean .mcp.json
+        mcp_config_path = os.path.join(working_dir, ".mcp.json")
         if os.path.exists(mcp_config_path):
             try:
                 with open(mcp_config_path) as f:
@@ -284,6 +365,18 @@ class Plugin:
                     os.unlink(mcp_config_path)
             except (json.JSONDecodeError, OSError):
                 pass
+
+        # Remove the skill symlink we created (never the user's real skill)
+        if self._skill_link_created and os.path.islink(self._skill_link_created):
+            try:
+                os.unlink(self._skill_link_created)
+                skills_dir = os.path.dirname(self._skill_link_created)
+                if not os.listdir(skills_dir):
+                    os.rmdir(skills_dir)
+            except OSError:
+                pass
+        self._skill_link_created = None
+        self._skill_name = None
 
         # Clean CLAUDE.md block
         md_path = os.path.join(working_dir, "CLAUDE.md")
