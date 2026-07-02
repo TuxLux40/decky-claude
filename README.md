@@ -69,17 +69,18 @@ Steam Deck — Gaming Mode
 | Auto-capture | asyncio loop | Keeps `screen_latest.png` fresh |
 | Keyboard/mouse | `xdotool` → `ydotool` | Lets Claude navigate UI |
 | File access | Working directory | Logs, configs, saves |
-| Skill autoload | `~/.claude/skills/steam-debugger` | Loaded into every session |
+| Skill autoload | bundled `skills/steam-debugger` | Loaded into every session |
 
 ### Steam-debugger skill autoload
 
-If a skill whose folder name contains *steam* and *debug* (e.g.
-`steam-debugger`) exists under `~/.claude/skills/`, the plugin symlinks it
-into the session working directory (`.claude/skills/`) and instructs Claude —
-via the injected `CLAUDE.md` block — to invoke it at the start of the session,
-before any Steam/game debugging work. The panel shows whether the skill was
-found. The symlink and all injected config are removed again when the session
-stops.
+The plugin ships with a `steam-debugger` skill (`skills/steam-debugger/`),
+which is symlinked into the session working directory (`.claude/skills/`) on
+start. The injected `CLAUDE.md` block instructs Claude to invoke it at the
+start of the session, before any Steam/game debugging work. If a skill whose
+folder name contains *steam* and *debug* exists under `~/.claude/skills/`, it
+takes precedence over the bundled one — so you can customize it without
+touching the plugin. The panel shows which skill was loaded. The symlink and
+all injected config are removed again when the session stops.
 
 ---
 
@@ -113,7 +114,8 @@ Or push a `v1.x.x` tag to trigger the GitHub Actions release — download `decky
 
 ### Side-load via Decky
 
-Copy the plugin folder (containing `dist/`, `main.py`, `plugin.json`) to:
+Copy the plugin folder (containing `dist/`, `skills/`, `main.py`,
+`mcp_server.py`, `plugin.json`, `package.json`) to:
 ```
 ~/homebrew/plugins/decky-claude/
 ```
@@ -137,7 +139,7 @@ Then restart the Decky plugin loader.
 - [x] Screenshot on demand (MCP tool — Claude calls it automatically)
 - [x] Autonomous UI navigation via keyboard, mouse, text input (MCP tools)
 - [x] CLAUDE.md injection — instructs Claude to screenshot before answering game questions
-- [x] steam-debugger skill autoload (`~/.claude/skills/steam-debugger`)
+- [x] steam-debugger skill autoload (bundled; `~/.claude/skills` overrides)
 - [ ] Game process detection (identify which game is running)
 - [ ] Log file watcher (tail Steam / Proton logs into Claude's context)
 - [ ] Gamepad input via `ydotool` evdev events

@@ -15,10 +15,12 @@ _URL_PATTERN = re.compile(r"https://claude\.ai/code/session_[A-Za-z0-9_-]+")
 _MD_START = "<!-- decky-claude-start -->"
 _MD_END = "<!-- decky-claude-end -->"
 
-# Directories scanned for the user's steam-debugger skill
+# Directories scanned for the steam-debugger skill. A personal copy in
+# ~/.claude/skills overrides the one bundled with the plugin.
 _SKILL_BASES = [
     os.path.expanduser("~/.claude/skills"),
     "/home/deck/.claude/skills",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills"),
 ]
 
 

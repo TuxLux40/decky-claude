@@ -30,7 +30,7 @@ jobs:
       - name: Package plugin
         run: |
           mkdir -p out/decky-claude
-          cp -r dist plugin.json main.py LICENSE out/decky-claude/
+          cp -r dist skills plugin.json package.json main.py mcp_server.py LICENSE out/decky-claude/
           cd out
           zip -r decky-claude.zip decky-claude/
 
