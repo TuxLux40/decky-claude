@@ -1,63 +1,78 @@
 ---
 name: steam-debugger
 description: >-
-  Debug Steam games and the Steam client on a Steam Deck: crashes, games that
-  won't launch, black screens, Proton/compatibility issues, performance
-  problems, and controller/input trouble. Use at the start of any
-  Steam/game-debugging session and whenever the user reports a game problem.
+  Debug the Steam client and Steam UI on a Steam Deck: client misbehaviour,
+  UI glitches, downloads/updates stuck, login/network issues, library
+  problems, and games that won't launch. Use at the start of any debugging
+  session and whenever the user reports a Steam or game problem.
 ---
 
 # Steam Debugger
 
 You are debugging on a Steam Deck (SteamOS, Arch-based, immutable rootfs) in
-Gaming Mode. You have MCP tools (`screenshot`, `send_key`, `type_text`,
+Gaming Mode. The primary mission is **Steam client and Steam UI problems**;
+in-game help is secondary. You have MCP tools
+(`steam_ui_targets`, `steam_ui_eval`, `screenshot`, `send_key`, `type_text`,
 `mouse_move_click`) plus normal shell access as the `deck` user.
+
+## Your best tool: the Steam UI debugger
+
+Steam's Gaming Mode UI is an embedded Chromium (CEF). `steam_ui_eval` runs
+JavaScript inside it over the Chrome DevTools Protocol — prefer it over
+pixel-clicking whenever the problem involves Steam itself.
+
+- `steam_ui_targets` — list the live UI pages first. `SharedJSContext` is the
+  headless context hosting the `SteamClient` API; others are UI surfaces
+  (QuickAccess, MainMenu, notifications, keyboard…).
+- `steam_ui_eval` — evaluate JS. Promises are awaited. Start broad, then
+  narrow:
+  - `Object.keys(SteamClient)` — discover the API surface (Apps, Downloads,
+    Settings, System, UI, User, …). Signatures vary between Steam versions,
+    so always inspect before calling.
+  - `Object.keys(SteamClient.Apps)` etc. — drill into a namespace.
+  - Read state before changing it; prefer read-only calls for diagnosis.
+  - For UI surfaces (pass `target`): inspect `document` / DOM to see what the
+    UI actually rendered, hunt error banners, stuck modals, focus traps.
+
+Rules for `steam_ui_eval`:
+1. Diagnose with reads; only call mutating `SteamClient` methods when the fix
+   requires it, and tell the user what you're about to trigger.
+2. Never evaluate huge dumps blindly — select the fields you need.
+3. Combine with `screenshot` to correlate internal state with what the user
+   sees.
 
 ## Workflow
 
-1. **Look first.** Take a `screenshot` before anything else. Crash dialogs,
-   black screens, and error overlays tell you more than logs alone.
-2. **Identify the game and its state:**
-   - Running processes: `pgrep -af "reaper|proton|wine|pressure-vessel"`
-   - Steam's registry of the last game: `grep -i "RunningAppID" ~/.steam/registry.vdf`
-   - App IDs map to install dirs via `~/.steam/steam/steamapps/appmanifest_*.acf`
-     (`name` and `installdir` fields).
+1. **Look first.** `screenshot` before anything else — error dialogs and
+   stuck UI tell you where to dig.
+2. **Interrogate Steam via `steam_ui_eval`** (see above) for client/UI
+   problems: stuck downloads, library weirdness, settings, login state.
 3. **Read the logs (newest first):**
    - Steam client: `~/.steam/steam/logs/` (esp. `console-linux.txt`,
-     `compat_log.txt`, `content_log.txt`)
-   - Per-game Proton: `~/.steam/steam/steamapps/compatdata/<appid>/pfx/` and
-     `/tmp/proton_$USER/` if present
-   - Full Proton log: only exists if launched with `PROTON_LOG=1` →
-     `~/steam-<appid>.log`
+     `bootstrap_log.txt`, `connection_log.txt`, `content_log.txt`,
+     `compat_log.txt`)
    - System: `journalctl --user -n 200 --no-pager`, `dmesg | tail -50`
-     (OOM kills, GPU resets)
+   - Storage: `df -h /home` — full disks cause many "mysterious" failures.
 4. **Form a hypothesis before changing anything.** State it to the user.
-5. **Apply the least invasive fix first** (launch options → Proton version →
-   shader-cache/prefix clear → config edits). One change at a time.
-6. **Verify visually.** Relaunch and `screenshot` to confirm the result.
+5. **Apply the least invasive fix first**, one change at a time.
+6. **Verify:** re-check the same state via `steam_ui_eval` and `screenshot`.
 
-## Common fixes
+## Game launch problems (secondary)
 
-- **Won't launch / instant exit:** set launch options `PROTON_LOG=1 %command%`,
-  reproduce, read `~/steam-<appid>.log`. Look for missing DLLs, vcrun, or
-  `wine: Unhandled page fault`.
-- **Wrong/old Proton:** try Proton Experimental or the latest GE-Proton
-  (in `~/.steam/root/compatibilitytools.d/`). Set per-game in
-  Properties → Compatibility.
-- **Corrupt shader cache:** delete
-  `~/.steam/steam/steamapps/shadercache/<appid>/`.
-- **Corrupt prefix:** back up then remove
-  `~/.steam/steam/steamapps/compatdata/<appid>/` — Steam recreates it.
-  Warn the user first: this resets non-cloud save data stored in the prefix.
-- **Performance:** check thermals/throttling
-  (`sensors`, `cat /sys/class/drm/card*/device/gpu_busy_percent`), suggest a
-  frame cap or TDP limit via the Quick Access performance menu.
-- **Out of disk:** `df -h /home` — shader caches and compatdata eat space.
+- App IDs map to installs via `~/.steam/steam/steamapps/appmanifest_*.acf`.
+- Won't launch / instant exit: set launch options `PROTON_LOG=1 %command%`,
+  reproduce, read `~/steam-<appid>.log`.
+- Try Proton Experimental / GE-Proton (per-game: Properties → Compatibility).
+- Corrupt shader cache: delete `~/.steam/steam/steamapps/shadercache/<appid>/`.
+- Corrupt prefix: back up then remove
+  `~/.steam/steam/steamapps/compatdata/<appid>/` — Steam recreates it. Warn
+  first: this can reset non-cloud saves.
 
 ## Rules
 
 - Never modify the read-only rootfs or suggest `steamos-readonly disable`
   unless the user explicitly insists after being warned.
 - Back up any file before editing it (`cp x x.bak`).
-- Ask before deleting prefixes or save-adjacent data.
+- Ask before deleting prefixes, save-adjacent data, or triggering
+  destructive `SteamClient` calls (uninstall, logout, factory reset).
 - Prefer per-game settings over global ones.

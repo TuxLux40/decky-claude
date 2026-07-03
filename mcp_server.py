@@ -6,9 +6,18 @@ No external dependencies — pure Python stdlib + grim/xdotool/ydotool binaries.
 import base64
 import json
 import os
+import re
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
+
+# Steam's CEF remote debugger (Decky Loader keeps it enabled)
+CEF_HOST = os.environ.get("DECKY_CLAUDE_CEF_HOST", "127.0.0.1")
+CEF_PORT = int(os.environ.get("DECKY_CLAUDE_CEF_PORT", "8080"))
 
 # ── display environment ────────────────────────────────────────────────────────
 
@@ -45,9 +54,174 @@ def _run(cmd: list[str]) -> tuple[int, str]:
     except subprocess.TimeoutExpired:
         return 1, "timeout"
 
+# ── Chrome DevTools Protocol client (for Steam's CEF UI) ──────────────────────
+
+class _WebSocket:
+    """Minimal RFC 6455 client — just enough for a CDP request/response."""
+
+    def __init__(self, url: str, timeout: float = 10.0):
+        m = re.match(r"ws://([^:/]+):(\d+)(/.*)", url)
+        if not m:
+            raise ValueError(f"unsupported ws url: {url}")
+        host, port, path = m.group(1), int(m.group(2)), m.group(3)
+        self.sock = socket.create_connection((host, port), timeout=timeout)
+        self.sock.settimeout(timeout)
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall(
+            (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host}:{port}\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n\r\n"
+            ).encode()
+        )
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("handshake: connection closed")
+            response += chunk
+        if b" 101 " not in response.split(b"\r\n", 1)[0]:
+            raise ConnectionError(f"handshake rejected: {response[:120]!r}")
+
+    def _read_exact(self, n: int) -> bytes:
+        buf = b""
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("connection closed mid-frame")
+            buf += chunk
+        return buf
+
+    def send_text(self, text: str) -> None:
+        payload = text.encode()
+        mask = os.urandom(4)
+        header = bytearray([0x81])  # FIN + text
+        n = len(payload)
+        if n < 126:
+            header.append(0x80 | n)
+        elif n < 1 << 16:
+            header.append(0x80 | 126)
+            header += struct.pack(">H", n)
+        else:
+            header.append(0x80 | 127)
+            header += struct.pack(">Q", n)
+        header += mask
+        self.sock.sendall(bytes(header) + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+    def recv_message(self) -> str:
+        """Read one complete (possibly fragmented) text message."""
+        parts: list[bytes] = []
+        while True:
+            b1, b2 = self._read_exact(2)
+            fin, opcode = b1 & 0x80, b1 & 0x0F
+            n = b2 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self._read_exact(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self._read_exact(8))[0]
+            if b2 & 0x80:  # masked server frame — not expected, but handle it
+                mask = self._read_exact(4)
+                data = bytes(b ^ mask[i % 4] for i, b in enumerate(self._read_exact(n)))
+            else:
+                data = self._read_exact(n)
+            if opcode == 0x8:  # close
+                raise ConnectionError("server closed connection")
+            if opcode == 0x9:  # ping → pong
+                self.sock.sendall(bytes([0x8A, 0x80]) + os.urandom(4))
+                continue
+            if opcode in (0x1, 0x0):
+                parts.append(data)
+                if fin:
+                    return b"".join(parts).decode(errors="replace")
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def _cef_targets() -> list[dict]:
+    with urllib.request.urlopen(f"http://{CEF_HOST}:{CEF_PORT}/json", timeout=5) as r:
+        return json.loads(r.read().decode())
+
+
+def _cef_eval(expression: str, target: str = "SharedJSContext", timeout: float = 15.0) -> dict:
+    targets = _cef_targets()
+    needle = target.lower()
+    match = next(
+        (
+            t for t in targets
+            if needle in (t.get("title") or "").lower()
+            or needle in (t.get("url") or "").lower()
+        ),
+        None,
+    )
+    if not match:
+        titles = [t.get("title") or t.get("url") for t in targets]
+        raise LookupError(f"no CEF target matching {target!r}; available: {titles}")
+
+    ws = _WebSocket(match["webSocketDebuggerUrl"], timeout=timeout)
+    try:
+        ws.send_text(json.dumps({
+            "id": 1,
+            "method": "Runtime.evaluate",
+            "params": {
+                "expression": expression,
+                "returnByValue": True,
+                "awaitPromise": True,
+            },
+        }))
+        while True:
+            msg = json.loads(ws.recv_message())
+            if msg.get("id") == 1:
+                return msg
+    finally:
+        ws.close()
+
 # ── tool definitions ───────────────────────────────────────────────────────────
 
 TOOLS = [
+    {
+        "name": "steam_ui_targets",
+        "description": (
+            "List the Steam client's UI pages (Chrome DevTools Protocol targets "
+            "on the CEF debugger, port 8080). Use this to see which contexts "
+            "exist before steam_ui_eval. 'SharedJSContext' hosts the SteamClient "
+            "API; other targets are UI surfaces like QuickAccess or MainMenu."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "steam_ui_eval",
+        "description": (
+            "Evaluate JavaScript inside the Steam client UI via the Chrome "
+            "DevTools Protocol — the primary tool for debugging Steam itself. "
+            "Runs in 'SharedJSContext' by default, where the SteamClient API "
+            "lives: explore with Object.keys(SteamClient), inspect apps, "
+            "settings, downloads, or trigger real Steam actions instead of "
+            "clicking pixels. Set target to another page title (from "
+            "steam_ui_targets) to inspect that page's DOM/state."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "expression": {
+                    "type": "string",
+                    "description": "JavaScript expression (promises are awaited)",
+                },
+                "target": {
+                    "type": "string",
+                    "description": "Substring of the target page title (default: SharedJSContext)",
+                    "default": "SharedJSContext",
+                },
+            },
+            "required": ["expression"],
+        },
+    },
     {
         "name": "screenshot",
         "description": (
@@ -178,7 +352,56 @@ def _handle_mouse_move_click(x: int, y: int, button: str = "left") -> list[dict]
     return [{"type": "text", "text": f"mouse_move_click failed: {err}"}]
 
 
+_MAX_EVAL_OUTPUT = 20000
+
+
+def _handle_steam_ui_targets() -> list[dict]:
+    try:
+        targets = _cef_targets()
+    except (urllib.error.URLError, OSError) as exc:
+        return [{"type": "text", "text": (
+            f"Steam CEF debugger not reachable on {CEF_HOST}:{CEF_PORT} ({exc}). "
+            "It should be enabled whenever Decky Loader is running."
+        )}]
+    summary = [
+        {"title": t.get("title"), "type": t.get("type"), "url": t.get("url")}
+        for t in targets
+    ]
+    return [{"type": "text", "text": json.dumps(summary, indent=2)}]
+
+
+def _handle_steam_ui_eval(expression: str, target: str) -> list[dict]:
+    try:
+        msg = _cef_eval(expression, target)
+    except (urllib.error.URLError, OSError, ConnectionError) as exc:
+        return [{"type": "text", "text": (
+            f"Steam CEF debugger not reachable on {CEF_HOST}:{CEF_PORT} ({exc}). "
+            "It should be enabled whenever Decky Loader is running."
+        )}]
+    except LookupError as exc:
+        return [{"type": "text", "text": str(exc)}]
+
+    result = msg.get("result", {})
+    if "exceptionDetails" in result:
+        detail = result["exceptionDetails"]
+        text = detail.get("exception", {}).get("description") or json.dumps(detail)
+        return [{"type": "text", "text": f"JS exception: {text[:_MAX_EVAL_OUTPUT]}"}]
+
+    value = result.get("result", {})
+    out = json.dumps(value.get("value"), indent=2, default=str) \
+        if "value" in value else json.dumps(value, indent=2)
+    if len(out) > _MAX_EVAL_OUTPUT:
+        out = out[:_MAX_EVAL_OUTPUT] + "\n… (truncated — narrow your expression)"
+    return [{"type": "text", "text": out}]
+
+
 def _dispatch(name: str, args: dict) -> list[dict]:
+    if name == "steam_ui_targets":
+        return _handle_steam_ui_targets()
+    if name == "steam_ui_eval":
+        return _handle_steam_ui_eval(
+            args.get("expression", ""), args.get("target", "SharedJSContext")
+        )
     if name == "screenshot":
         return _handle_screenshot()
     if name == "send_key":
