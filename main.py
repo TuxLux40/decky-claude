@@ -735,10 +735,26 @@ class Plugin:
     # ── private helpers ────────────────────────────────────────────────────────
 
     def _display_env(self) -> dict[str, str]:
+        """Environment overlay for every child process we spawn.
+
+        plugin_loader.service runs as root, so children inherit HOME=/root even
+        though Decky drops the plugin to the desktop user's uid. `claude` then
+        looks for credentials under /root, finds none, and reports itself
+        logged out — which also makes `--remote-control` exit before printing a
+        session URL. Pin HOME/USER to the resolved desktop user so the CLI
+        reads the right config regardless of how the service was launched.
+        """
         # uid 1000 is the SteamOS default but not universal, so derive the
         # runtime dir from the resolved desktop user instead of hardcoding it.
         runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{_USER_UID}"
-        env: dict[str, str] = {"XDG_RUNTIME_DIR": runtime_dir}
+        env: dict[str, str] = {
+            "XDG_RUNTIME_DIR": runtime_dir,
+            "HOME": _USER_HOME,
+        }
+        try:
+            env["USER"] = env["LOGNAME"] = pwd.getpwuid(_USER_UID).pw_name
+        except KeyError:
+            pass
         for wd in ["wayland-0", "wayland-1", "wayland-2"]:
             if os.path.exists(os.path.join(runtime_dir, wd)):
                 env["WAYLAND_DISPLAY"] = wd
@@ -795,6 +811,7 @@ class Plugin:
                 "which", "claude",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
+                env={**os.environ, **self._display_env()},
             )
             out, _ = await proc.communicate()
             if proc.returncode == 0:
