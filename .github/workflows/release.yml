@@ -22,7 +22,7 @@ jobs:
           version: 10
 
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
       - name: Build frontend
         run: pnpm build
@@ -30,7 +30,9 @@ jobs:
       - name: Package plugin
         run: |
           mkdir -p out/decky-claude
-          cp -r dist skills plugin.json package.json main.py mcp_server.py LICENSE out/decky-claude/
+          cp -r dist skills plugin.json package.json main.py mcp_server.py LICENSE README.md out/decky-claude/
+          # Sourcemaps are ~70x the bundle size and unused at runtime.
+          rm -f out/decky-claude/dist/*.map
           cd out
           zip -r decky-claude.zip decky-claude/
 

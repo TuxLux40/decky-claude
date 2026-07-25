@@ -23,9 +23,12 @@ CEF_PORT = int(os.environ.get("DECKY_CLAUDE_CEF_PORT", "8080"))
 
 def _display_env() -> dict[str, str]:
     env = dict(os.environ)
-    env["XDG_RUNTIME_DIR"] = "/run/user/1000"
+    # uid 1000 is the SteamOS default but not universal — derive the runtime
+    # dir from the environment or the current user rather than hardcoding it.
+    runtime_dir = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    env["XDG_RUNTIME_DIR"] = runtime_dir
     for wd in ["wayland-0", "wayland-1", "wayland-2"]:
-        if os.path.exists(f"/run/user/1000/{wd}"):
+        if os.path.exists(os.path.join(runtime_dir, wd)):
             env.setdefault("WAYLAND_DISPLAY", wd)
             break
     env.setdefault("DISPLAY", ":0")

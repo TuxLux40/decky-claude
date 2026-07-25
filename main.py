@@ -4,6 +4,8 @@ import glob
 import json
 import logging
 import os
+import pty
+import pwd
 import re
 
 logger = logging.getLogger("decky-claude")
@@ -15,11 +17,50 @@ _URL_PATTERN = re.compile(r"https://claude\.ai/code/session_[A-Za-z0-9_-]+")
 _MD_START = "<!-- decky-claude-start -->"
 _MD_END = "<!-- decky-claude-end -->"
 
+
+def _resolve_user() -> tuple[str, int]:
+    """Home directory and uid of the desktop user owning the Steam session.
+
+    Hardcoding /home/deck only works on SteamOS. Decky exports DECKY_USER /
+    DECKY_USER_HOME, and the backend normally already runs as the desktop user,
+    so prefer those signals and treat "deck" as a last-resort guess.
+    """
+    home = os.environ.get("DECKY_USER_HOME")
+    user = os.environ.get("DECKY_USER")
+
+    if user:
+        try:
+            entry = pwd.getpwnam(user)
+            return home or entry.pw_dir, entry.pw_uid
+        except KeyError:
+            pass
+    if home:
+        try:
+            return home, pwd.getpwnam(os.path.basename(home)).pw_uid
+        except KeyError:
+            return home, os.getuid()
+
+    # Normal case: the plugin backend runs as the desktop user already.
+    uid = os.getuid()
+    if uid != 0:
+        try:
+            entry = pwd.getpwuid(uid)
+            return entry.pw_dir, uid
+        except KeyError:
+            pass
+    try:
+        entry = pwd.getpwnam("deck")
+        return entry.pw_dir, entry.pw_uid
+    except KeyError:
+        return os.path.expanduser("~"), uid
+
+
+_USER_HOME, _USER_UID = _resolve_user()
+
 # Directories scanned for the steam-debugger skill. A personal copy in
 # ~/.claude/skills overrides the one bundled with the plugin.
 _SKILL_BASES = [
-    os.path.expanduser("~/.claude/skills"),
-    "/home/deck/.claude/skills",
+    os.path.join(_USER_HOME, ".claude", "skills"),
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills"),
 ]
 
@@ -88,9 +129,10 @@ _KEY_MAP: dict[str, str] = {
 class Plugin:
     # ── session state ──────────────────────────────────────────────────────────
     _process: asyncio.subprocess.Process | None = None
+    _pty_master_fd: int | None = None
     _session_url: str | None = None
     _status: str = "stopped"
-    _working_dir: str = "/home/deck"
+    _working_dir: str = _USER_HOME
     _error_msg: str | None = None
     _log_lines: list[str] = []
     _skill_name: str | None = None
@@ -110,10 +152,11 @@ class Plugin:
 
     # ── session API ────────────────────────────────────────────────────────────
 
-    async def start_session(self, working_dir: str = "/home/deck"):
+    async def start_session(self, working_dir: str = ""):
         if self._process and self._process.returncode is None:
             return {"success": False, "error": "Session already running"}
 
+        working_dir = working_dir or _USER_HOME
         self._working_dir = working_dir
         self._session_url = None
         self._error_msg = None
@@ -129,21 +172,33 @@ class Plugin:
             return {"success": False, "error": self._error_msg}
 
         mcp_config = self._setup_working_dir(working_dir)
+        self._trust_working_dir(working_dir)
+
+        # claude falls back to non-interactive "-p" behaviour (which then
+        # demands a prompt) whenever stdout isn't a TTY, so a plain pipe
+        # can't be used here — give it a pty to keep it in interactive
+        # remote-control mode while we still capture its output.
+        master_fd, slave_fd = pty.openpty()
 
         env = {**os.environ, **self._display_env()}
         try:
             self._process = await asyncio.create_subprocess_exec(
-                claude_bin, "--rc", "--mcp-config", mcp_config,
+                claude_bin, "--remote-control", "--mcp-config", mcp_config,
                 cwd=working_dir,
                 env=env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
+                stdout=slave_fd,
+                stderr=slave_fd,
                 stdin=asyncio.subprocess.DEVNULL,
             )
         except Exception as exc:
+            os.close(slave_fd)
+            os.close(master_fd)
             self._status = "error"
             self._error_msg = str(exc)
             return {"success": False, "error": self._error_msg}
+        os.close(slave_fd)
+
+        self._pty_master_fd = master_fd
 
         asyncio.ensure_future(self._drain_output())
 
@@ -177,6 +232,13 @@ class Plugin:
                 pass
             self._process = None
 
+        if self._pty_master_fd is not None:
+            try:
+                os.close(self._pty_master_fd)
+            except OSError:
+                pass
+            self._pty_master_fd = None
+
         self._cleanup_working_dir(self._working_dir)
         self._session_url = None
         self._status = "stopped"
@@ -201,7 +263,7 @@ class Plugin:
         return {"lines": self._log_lines[-30:]}
 
     async def list_dirs(self):
-        base = "/home/deck"
+        base = _USER_HOME
         dirs = [base]
         try:
             for entry in sorted(os.listdir(base)):
@@ -253,6 +315,35 @@ class Plugin:
         return await self._run_cmd(["ydotool", "click", btn_code], env)
 
     # ── working-dir setup / teardown ───────────────────────────────────────────
+
+    def _trust_working_dir(self, working_dir: str) -> None:
+        """Pre-accept the workspace trust dialog for working_dir, mirroring
+        what answering 'Yes, I trust this folder' does. Needed because the
+        remote-control session has no local TTY to answer the prompt on."""
+        config_path = os.path.expanduser("~/.claude.json")
+        try:
+            with open(config_path) as f:
+                config = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+
+        projects = config.setdefault("projects", {})
+        real_dir = os.path.realpath(working_dir)
+        entry = projects.setdefault(real_dir, {})
+        if entry.get("hasTrustDialogAccepted"):
+            return
+        entry["hasTrustDialogAccepted"] = True
+
+        tmp_path = config_path + ".tmp"
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(config, f, indent=2)
+            os.replace(tmp_path, config_path)
+        except OSError:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
     def _setup_working_dir(self, working_dir: str) -> str:
         """Write .mcp.json, link the steam-debugger skill, inject our CLAUDE.md
@@ -409,10 +500,12 @@ class Plugin:
     # ── private helpers ────────────────────────────────────────────────────────
 
     def _display_env(self) -> dict[str, str]:
-        env: dict[str, str] = {}
-        env["XDG_RUNTIME_DIR"] = "/run/user/1000"
+        # uid 1000 is the SteamOS default but not universal, so derive the
+        # runtime dir from the resolved desktop user instead of hardcoding it.
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{_USER_UID}"
+        env: dict[str, str] = {"XDG_RUNTIME_DIR": runtime_dir}
         for wd in ["wayland-0", "wayland-1", "wayland-2"]:
-            if os.path.exists(f"/run/user/1000/{wd}"):
+            if os.path.exists(os.path.join(runtime_dir, wd)):
                 env["WAYLAND_DISPLAY"] = wd
                 break
         env.setdefault("DISPLAY", ":0")
@@ -476,35 +569,46 @@ class Plugin:
         except OSError:
             pass
         for path in [
-            "/home/deck/.local/share/pnpm/claude",
-            "/home/deck/.local/bin/claude",
+            os.path.join(_USER_HOME, ".local/share/pnpm/claude"),
+            os.path.join(_USER_HOME, ".local/bin/claude"),
+            os.path.join(_USER_HOME, ".bun/bin/claude"),
             "/usr/local/bin/claude",
             "/usr/bin/claude",
-        ] + glob.glob("/home/deck/.nvm/versions/node/*/bin/claude"):
+        ] + glob.glob(os.path.join(_USER_HOME, ".nvm/versions/node/*/bin/claude")):
             if os.path.isfile(path) and os.access(path, os.X_OK):
                 return path
         return None
 
     async def _drain_output(self):
+        loop = asyncio.get_event_loop()
+        fd = self._pty_master_fd
+        buf = b""
         try:
             while True:
-                raw = await self._process.stdout.readline()
-                if not raw:
+                try:
+                    chunk = await loop.run_in_executor(None, os.read, fd, 4096)
+                except OSError:
+                    # EIO on a pty means the slave side closed — process exited.
                     break
-                line = _ANSI_ESCAPE.sub("", raw.decode("utf-8", errors="replace")).strip()
-                if not line:
-                    continue
-                logger.info("claude: %s", line)
-                self._log_lines.append(line)
-                match = _URL_PATTERN.search(line)
-                if match and not self._session_url:
-                    self._session_url = match.group(0)
-                    if self._status == "starting":
-                        self._status = "running"
-                lower = line.lower()
-                if any(kw in lower for kw in ("not logged in", "api key", "auth", "error")):
-                    if self._status == "starting":
-                        self._error_msg = line
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    raw, buf = buf.split(b"\n", 1)
+                    line = _ANSI_ESCAPE.sub("", raw.decode("utf-8", errors="replace")).strip()
+                    if not line:
+                        continue
+                    logger.info("claude: %s", line)
+                    self._log_lines.append(line)
+                    match = _URL_PATTERN.search(line)
+                    if match and not self._session_url:
+                        self._session_url = match.group(0)
+                        if self._status == "starting":
+                            self._status = "running"
+                    lower = line.lower()
+                    if any(kw in lower for kw in ("not logged in", "api key", "auth", "error")):
+                        if self._status == "starting":
+                            self._error_msg = line
         except Exception as exc:
             logger.error("drain_output error: %s", exc)
         finally:

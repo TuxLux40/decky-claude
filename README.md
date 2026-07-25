@@ -8,7 +8,7 @@ Tap *Start Remote Session* in the Quick Access menu, open the session URL in the
 
 ## What it does
 
-1. **Phone-controlled Claude Code** — the plugin launches `claude --rc` (remote control) in a working directory you pick and shows the `https://claude.ai/code/session_…` URL in the panel. Open it in the Claude app and drive the session from your phone.
+1. **Phone-controlled Claude Code** — the plugin launches `claude --remote-control` (remote control) in a working directory you pick and shows the `https://claude.ai/code/session_…` URL in the panel. Open it in the Claude app and drive the session from your phone.
 2. **Steam UI debugger (the main event)** — Steam's Gaming Mode UI is embedded Chromium (CEF) with its DevTools debugger on `localhost:8080` (Decky itself relies on it). Claude gets `steam_ui_eval`: it runs JavaScript inside Steam over the Chrome DevTools Protocol, inspects the `SteamClient` API, reads real client state (downloads, library, settings, login), and triggers real actions — no pixel-hunting.
 3. **Eyes and hands** — `screenshot` returns what's on screen as an image; `send_key` / `type_text` / `mouse_move_click` inject input via `xdotool`/`ydotool`. This covers everything that isn't Steam's own UI (dialogs, games).
 4. **steam-debugger skill, autoloaded** — a bundled Claude Code skill encodes the debugging workflow (interrogate Steam UI first, log locations, least-invasive-fix rules, safety rails). It is linked into every session and Claude is instructed to load it at session start. A personal copy in `~/.claude/skills/` (any folder named like *steam…debug…*) overrides the bundled one.
@@ -19,15 +19,15 @@ In-game help (asking Claude about the game you're playing) works through the sam
 
 ```
 Your phone (Claude app)
-      │  claude.ai/code session (claude --rc)
+      │  claude.ai/code session (claude --remote-control)
       ▼
 Steam Deck — Gaming Mode
   ┌───────────────────────────────────────────┐
   │ Decky Quick Access panel (React)          │
-  │   └─ main.py backend: spawns claude --rc, │
+  │   └─ main.py backend: spawns claude --remote-control, │
   │      links skill, writes .mcp.json        │
   │                                           │
-  │ claude --rc ──► mcp_server.py (stdio MCP) │
+  │ claude --remote-control ──► mcp_server.py (stdio MCP) │
   │                   ├─ steam_ui_eval ───────┼──► Steam CEF debugger :8080
   │                   ├─ screenshot (grim)    │    (Chrome DevTools Protocol)
   │                   └─ send_key/type/click  │
@@ -63,9 +63,21 @@ which grim || sudo pacman -S grim
 
 Decky Loader must be installed — it also keeps Steam's CEF debugger enabled, which `steam_ui_eval` needs.
 
+> Not on SteamOS? That works too. The plugin resolves the desktop user from
+> `DECKY_USER_HOME` / `DECKY_USER` (falling back to the account the backend runs
+> as), so it does not assume a `deck` user or uid 1000.
+
 ### From a release
 
-Download `decky-claude.zip` from the GitHub releases (built by CI on every `v*` tag) and extract it to `~/homebrew/plugins/`, then restart Decky Loader.
+Download `decky-claude.zip` from the [GitHub releases][releases] (built by CI on every `v*` tag) and extract it to `~/homebrew/plugins/`, then restart Decky Loader:
+
+```bash
+systemctl restart plugin_loader
+```
+
+This plugin is distributed here rather than through the official Decky store, so it will not appear in the in-app store listing — install it from a release or from source.
+
+[releases]: https://github.com/TuxLux40/decky-claude/releases
 
 ### From source
 
@@ -98,7 +110,7 @@ The panel also offers a manual screenshot preview and manual key/mouse/text inpu
 
 ## Roadmap
 
-- [x] Phone-controlled `claude --rc` sessions from the Quick Access menu
+- [x] Phone-controlled `claude --remote-control` sessions from the Quick Access menu
 - [x] Steam UI debugging via Chrome DevTools Protocol (`steam_ui_eval`)
 - [x] Screenshot + keyboard/mouse/text MCP tools
 - [x] Bundled steam-debugger skill, autoloaded (personal copy overrides)
