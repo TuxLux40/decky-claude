@@ -30,7 +30,7 @@ jobs:
       - name: Package plugin
         run: |
           mkdir -p out/decky-claude
-          cp -r dist skills plugin.json package.json main.py mcp_server.py deck_common.py LICENSE README.md out/decky-claude/
+          cp -r dist skills plugin.json package.json main.py mcp_server.py deck_common.py machine_profile.py LICENSE README.md out/decky-claude/
           # Sourcemaps are ~70x the bundle size and unused at runtime.
           rm -f out/decky-claude/dist/*.map
           cd out

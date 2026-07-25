@@ -104,7 +104,7 @@ pnpm install
 pnpm build
 ```
 
-Copy the plugin folder (containing `dist/`, `skills/`, `main.py`, `mcp_server.py`, `deck_common.py`, `plugin.json`, `package.json`) to `~/homebrew/plugins/decky-claude/` and restart Decky Loader.
+Copy the plugin folder (containing `dist/`, `skills/`, `main.py`, `mcp_server.py`, `deck_common.py`, `machine_profile.py`, `plugin.json`, `package.json`) to `~/homebrew/plugins/decky-claude/` and restart Decky Loader.
 
 ## Usage
 
@@ -125,6 +125,7 @@ The panel also offers a manual screenshot preview and manual key/mouse/text inpu
 |---|---|
 | `main.py` | Decky backend: session lifecycle, working-dir setup/cleanup, panel API |
 | `mcp_server.py` | Stdlib-only stdio MCP server: CDP client + screenshot + input tools |
+| `machine_profile.py` | Probes hardware/OS/session/Steam into the session's CLAUDE.md; run standalone to inspect |
 | `deck_common.py` | Display environment and xdotool/ydotool commands shared by both |
 | `src/index.tsx` | Quick Access panel (React, built to `dist/` by rollup) |
 | `skills/steam-debugger/` | Bundled Claude Code skill, autoloaded into sessions |

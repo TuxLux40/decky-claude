@@ -19,6 +19,7 @@ if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
 
 import deck_common  # noqa: E402  (needs the sys.path anchor above)
+import machine_profile  # noqa: E402
 
 logger = logging.getLogger("decky-claude")
 
@@ -80,7 +81,7 @@ _SKILL_BASES = [
 ]
 
 
-def _claude_md_block(skill_name: str | None) -> str:
+def _claude_md_block(skill_name: str | None, machine_md: str = "") -> str:
     skill_section = ""
     if skill_name:
         skill_section = f"""
@@ -91,13 +92,15 @@ The user's `{skill_name}` skill is installed for this session
 `{skill_name}` skill via the Skill tool at the start of the session, before
 doing any Steam or game debugging work, and follow its instructions.
 """
+    machine_section = f"\n{machine_md}\n" if machine_md else ""
     return f"""\
 {_MD_START}
-# Steam Deck Gaming Mode — decky-claude session
+# decky-claude session
 
-You are running via the decky-claude Decky Loader plugin on a Steam Deck.
-The user is in Gaming Mode and is messaging you from the Claude Android app.
-{skill_section}
+You are running via the decky-claude Decky Loader plugin, launched from the
+Steam Quick Access menu. The user is messaging you from the Claude app, most
+likely on their phone, and may not be able to read long output comfortably.
+{machine_section}{skill_section}
 ## MCP tools you have
 
 - **steam_snippet** — Curated, pre-verified SteamClient queries for the
@@ -155,6 +158,21 @@ class Plugin:
 
     # ── screen state ───────────────────────────────────────────────────────────
     _last_thumb_b64: str | None = None
+
+    @staticmethod
+    def _machine_md() -> str:
+        """Machine description for the session's CLAUDE.md.
+
+        Regenerated per session rather than cached: it costs ~50ms of file
+        reads, and the parts most worth knowing (free space, installed games,
+        whether Gaming Mode is active) are exactly the parts that go stale.
+        Never fatal — a session without a profile is merely less informed.
+        """
+        try:
+            return machine_profile.render(machine_profile.collect(_USER_HOME, _USER_UID))
+        except Exception:
+            logger.exception("could not build machine profile")
+            return ""
 
     # ── lifecycle ──────────────────────────────────────────────────────────────
 
@@ -761,7 +779,7 @@ class Plugin:
                 with open(md_path, "a") as f:
                     if existing_md and not existing_md.endswith("\n"):
                         f.write("\n")
-                    f.write("\n" + _claude_md_block(self._skill_name))
+                    f.write("\n" + _claude_md_block(self._skill_name, self._machine_md()))
         except OSError as exc:
             logger.error("cannot update %s: %s", md_path, exc)
             raise
