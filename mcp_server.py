@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Minimal stdio MCP server exposing screen capture and input tools for Steam Deck.
-No external dependencies — pure Python stdlib + grim/xdotool/ydotool binaries.
+No external dependencies — pure Python stdlib + gamescopectl/xdotool/ydotool.
 """
 import base64
 import json
@@ -12,6 +12,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -27,21 +28,23 @@ def _display_env() -> dict[str, str]:
     # dir from the environment or the current user rather than hardcoding it.
     runtime_dir = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
     env["XDG_RUNTIME_DIR"] = runtime_dir
-    for wd in ["wayland-0", "wayland-1", "wayland-2"]:
-        if os.path.exists(os.path.join(runtime_dir, wd)):
-            env.setdefault("WAYLAND_DISPLAY", wd)
-            break
+    # Gaming Mode is a gamescope session: its socket is gamescope-N, which a
+    # wayland-N probe never matches. gamescopectl reads
+    # GAMESCOPE_WAYLAND_DISPLAY to reach the control protocol.
+    gamescope_socket = next(
+        (s for s in ("gamescope-0", "gamescope-1")
+         if os.path.exists(os.path.join(runtime_dir, s))),
+        None,
+    )
+    if gamescope_socket:
+        env.setdefault("GAMESCOPE_WAYLAND_DISPLAY", gamescope_socket)
+        env["WAYLAND_DISPLAY"] = gamescope_socket
+    else:
+        for wd in ["wayland-0", "wayland-1", "wayland-2"]:
+            if os.path.exists(os.path.join(runtime_dir, wd)):
+                env.setdefault("WAYLAND_DISPLAY", wd)
+                break
     env.setdefault("DISPLAY", ":0")
-    # Needed by the desktop-session screenshot fallbacks (spectacle talks to
-    # the compositor over the session bus, not over a Wayland protocol).
-    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={runtime_dir}/bus")
-    # Gaming Mode's socket is gamescope-N, which the wayland-N probe above
-    # never matches; gamescopectl reads this to find the control protocol.
-    for gs in ("gamescope-0", "gamescope-1"):
-        if os.path.exists(os.path.join(runtime_dir, gs)):
-            env.setdefault("GAMESCOPE_WAYLAND_DISPLAY", gs)
-            env.setdefault("WAYLAND_DISPLAY", gs)
-            break
     return env
 
 def _run(cmd: list[str], timeout: float = 10) -> tuple[int, str]:
@@ -288,51 +291,44 @@ _KEY_MAP = {
 }
 
 
-def SCREENSHOT_COMMANDS(path: str, env: dict[str, str]) -> list[tuple[list[str], float]]:
-    """Capture commands to try, in order, with a per-command timeout.
+def _gamescope_screenshot(path: str) -> str | None:
+    """Capture via gamescope, or an error string explaining why not.
 
-    Gaming Mode comes first, because that is what this plugin is for. Neither
-    gamescope nor KWin implements a Wayland screencopy protocol, so grim works
-    in neither of them and each session needs its own native path: gamescopectl
-    speaks gamescope's control protocol, spectacle drives KWin's D-Bus
-    interface (a Qt app, hence the much longer leash). grim still covers plain
-    wlroots compositors, and scrot/import cover X11.
+    This plugin targets Gaming Mode only, so capture goes through gamescope and
+    nothing else. That is not one option among several: it is the same
+    compositor-side capture the controller's screenshot button triggers (Steam
+    sets GAMESCOPECTRL_REQUEST_SCREENSHOT, gamescope does the work), just
+    addressed directly so the frame lands at a path we choose instead of in the
+    user's Steam screenshot library. gamescope implements no Wayland screencopy
+    protocol, so grim and friends cannot capture here regardless.
     """
-    commands = []
-    # Only when a gamescope socket was actually found: outside Gaming Mode
-    # gamescopectl still exits 0 after failing to connect, so an ungated attempt
-    # would just burn the file-existence check on every desktop capture.
-    if env.get("GAMESCOPE_WAYLAND_DISPLAY"):
-        commands.append((["gamescopectl", "screenshot", path], 15))
-    return commands + [
-        (["grim", path], 10),
-        (["spectacle", "-f", "-b", "-n", "-o", path], 25),
-        (["scrot", "-o", path], 10),
-        (["import", "-window", "root", path], 10),
-    ]
+    env = _display_env()
+    if not env.get("GAMESCOPE_WAYLAND_DISPLAY"):
+        return "not running under gamescope — screen capture needs Gaming Mode"
 
-
-SCREENSHOT_UNAVAILABLE = (
-    "Screenshot failed — no working capture tool "
-    "(tried gamescopectl / grim / spectacle / scrot / import)."
-)
+    # Outside a live gamescope, gamescopectl still exits 0 after failing to
+    # connect, so the file itself is the only trustworthy success signal.
+    rc, err = _run(["gamescopectl", "screenshot", path], timeout=15)
+    if rc != 0:
+        return err or "gamescopectl failed"
+    # gamescope writes the file from its own render thread, so it can land
+    # slightly after the command returns.
+    for _ in range(20):
+        if os.path.exists(path) and os.path.getsize(path):
+            return None
+        time.sleep(0.1)
+    return "gamescope produced no screenshot"
 
 
 def _handle_screenshot() -> list[dict]:
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         path = f.name
 
-    captured = False
-    for cmd, timeout in SCREENSHOT_COMMANDS(path, _display_env()):
-        rc, _ = _run(cmd, timeout=timeout)
-        if rc == 0 and os.path.exists(path) and os.path.getsize(path) > 0:
-            captured = True
-            break
-
-    if not captured:
+    failure = _gamescope_screenshot(path)
+    if failure:
         if os.path.exists(path):
             os.unlink(path)
-        return [{"type": "text", "text": SCREENSHOT_UNAVAILABLE}]
+        return [{"type": "text", "text": f"Screenshot failed — {failure}."}]
 
     with open(path, "rb") as f:
         data = base64.standard_b64encode(f.read()).decode()

@@ -885,9 +885,9 @@ class Plugin:
         runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{_USER_UID}"
         env["XDG_RUNTIME_DIR"] = runtime_dir
 
-        # Gaming Mode is a gamescope session, not a desktop one, and its socket
-        # is gamescope-N — a wayland-N probe alone never finds it. gamescopectl
-        # reads GAMESCOPE_WAYLAND_DISPLAY to reach the control protocol.
+        # Gaming Mode is a gamescope session: its socket is gamescope-N, which a
+        # wayland-N probe never matches. gamescopectl reads
+        # GAMESCOPE_WAYLAND_DISPLAY to reach the control protocol.
         gamescope_socket = next(
             (s for s in ("gamescope-0", "gamescope-1")
              if os.path.exists(os.path.join(runtime_dir, s))),
@@ -895,45 +895,37 @@ class Plugin:
         )
         if gamescope_socket:
             env.setdefault("GAMESCOPE_WAYLAND_DISPLAY", gamescope_socket)
-
-        for wd in ["wayland-0", "wayland-1", "wayland-2"]:
-            if os.path.exists(os.path.join(runtime_dir, wd)):
-                env["WAYLAND_DISPLAY"] = wd
-                break
+            env["WAYLAND_DISPLAY"] = gamescope_socket
         else:
-            if gamescope_socket:
-                env["WAYLAND_DISPLAY"] = gamescope_socket
+            for wd in ["wayland-0", "wayland-1", "wayland-2"]:
+                if os.path.exists(os.path.join(runtime_dir, wd)):
+                    env["WAYLAND_DISPLAY"] = wd
+                    break
         env.setdefault("DISPLAY", ":0")
-        # spectacle (the KWin screenshot path) talks to the compositor over the
-        # session bus rather than a Wayland protocol, so it needs the address.
-        env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={runtime_dir}/bus")
         return env
 
     async def _take_screenshot(self, out_path: str) -> dict:
         env = self._display_env()
-        # Gaming Mode first, because that is what this plugin is for. Neither
-        # gamescope nor KWin implements a Wayland screencopy protocol, so grim
-        # works in neither of them and each session needs its own native path:
-        # gamescopectl drives gamescope's control protocol, spectacle drives
-        # KWin's D-Bus interface. grim still covers plain wlroots compositors,
-        # and scrot/import cover X11.
-        candidates = []
-        # Only when a gamescope socket was actually found: outside Gaming Mode
-        # gamescopectl still exits 0 after failing to connect, so an ungated
-        # attempt would cost the file-wait below on every desktop capture.
-        if env.get("GAMESCOPE_WAYLAND_DISPLAY"):
-            candidates.append((["gamescopectl", "screenshot", out_path], 15))
-        candidates += [
-            (["grim", out_path], 10),
-            (["spectacle", "-f", "-b", "-n", "-o", out_path], 25),
-            (["scrot", "-o", out_path], 10),
-            (["import", "-window", "root", out_path], 10),
-        ]
+        # This plugin targets Gaming Mode only, so capture goes through
+        # gamescope and nothing else. That is not a fallback among options: it
+        # is the same compositor-side capture the controller's screenshot
+        # button triggers (Steam sets GAMESCOPECTRL_REQUEST_SCREENSHOT and
+        # gamescope does the work), just addressed directly so the frame lands
+        # at a path we choose instead of in the user's Steam screenshot
+        # library. gamescope implements no Wayland screencopy protocol, so
+        # grim and friends cannot capture here regardless.
+        if not env.get("GAMESCOPE_WAYLAND_DISPLAY"):
+            return {
+                "success": False,
+                "error": "Not running under gamescope — screen capture needs Gaming Mode",
+            }
 
-        for cmd, timeout in candidates:
-            r = await self._run_cmd(cmd, env, timeout=timeout)
-            if not r["success"]:
-                continue
+        # Outside a live gamescope, gamescopectl still exits 0 after failing to
+        # connect, so the file itself is the only trustworthy success signal.
+        r = await self._run_cmd(
+            ["gamescopectl", "screenshot", out_path], env, timeout=15
+        )
+        if r["success"]:
             # gamescope writes the file from its own render thread, so it can
             # land slightly after the command returns.
             for _ in range(20):
@@ -942,20 +934,17 @@ class Plugin:
                 await asyncio.sleep(0.1)
         return {
             "success": False,
-            "error": (
-                "No working screenshot tool "
-                "(tried gamescopectl/grim/spectacle/scrot/import)"
-            ),
+            "error": r.get("error") or "gamescope produced no screenshot",
         }
 
     async def _make_thumb(self, src: str) -> str | None:
         thumb = src.replace(".png", "_thumb.png")
-        env = self._display_env()
-        for cmd in [["grim", "-s", "0.3", thumb], ["convert", "-resize", "30%", src, thumb]]:
-            r = await self._run_cmd(cmd, env)
-            if r["success"] and os.path.exists(thumb):
-                src = thumb
-                break
+        # Downscale the frame we already have. (grim -s used to be tried first,
+        # but it re-captures rather than resizes and cannot run under gamescope
+        # anyway.) Falls through to the full-size image if convert is absent.
+        r = await self._run_cmd(["convert", "-resize", "30%", src, thumb])
+        if r["success"] and os.path.exists(thumb):
+            src = thumb
         try:
             with open(src, "rb") as f:
                 return base64.b64encode(f.read(512 * 1024)).decode()

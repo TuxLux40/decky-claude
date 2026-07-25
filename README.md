@@ -6,6 +6,23 @@ Tap *Start Remote Session* in the Quick Access menu, open the session URL in the
 
 ---
 
+## Scope: Gaming Mode only
+
+This plugin targets **Gaming Mode — a gamescope session** and nothing else.
+Screen capture goes through `gamescopectl`, which is the same compositor-side
+capture the controller's screenshot button triggers: Steam sets the
+`GAMESCOPECTRL_REQUEST_SCREENSHOT` atom and gamescope takes the frame. Calling
+it directly just lets the frame land at a path we choose instead of in your
+Steam screenshot library.
+
+There is deliberately no desktop fallback. gamescope implements no Wayland
+screencopy protocol, so `grim` cannot capture there, and a desktop session
+would need a compositor-specific path of its own (KWin, for instance, exposes
+capture only over its own D-Bus interface). Supporting both means carrying a
+tool per desktop environment for a case this plugin is not for. Run Big Picture
+inside a desktop session and the session features still work — `screenshot`
+will simply report that it needs Gaming Mode.
+
 ## What it does
 
 1. **Phone-controlled Claude Code** — the plugin launches `claude --remote-control` (remote control) in a working directory you pick and shows the `https://claude.ai/code/session_…` URL in the panel. Open it in the Claude app and drive the session from your phone.
@@ -29,7 +46,7 @@ Steam Deck — Gaming Mode
   │                                           │
   │ claude --remote-control ──► mcp_server.py (stdio MCP) │
   │                   ├─ steam_ui_eval ───────┼──► Steam CEF debugger :8080
-  │                   ├─ screenshot (grim)    │    (Chrome DevTools Protocol)
+  │                   ├─ screenshot (gamescope) │    (Chrome DevTools Protocol)
   │                   └─ send_key/type/click  │
   │                      (xdotool/ydotool)    │
   └───────────────────────────────────────────┘
@@ -57,14 +74,9 @@ Everything injected into the working directory (`.mcp.json`, the `CLAUDE.md` blo
 npm install -g @anthropic-ai/claude-code
 claude
 
-# grim is usually preinstalled on SteamOS; ydotool is optional
-which grim || sudo pacman -S grim
+# gamescopectl ships with gamescope; ydotool is optional
+which gamescopectl
 ```
-
-Screenshots go through the first tool that works: `grim` (gamescope/wlroots,
-i.e. Gaming Mode), then `spectacle`, then `scrot`/`import`. On a Plasma desktop
-`grim` can never work — KWin advertises no screencopy protocol — so install
-`spectacle` there instead.
 
 Decky Loader must be installed — it also keeps Steam's CEF debugger enabled, which `steam_ui_eval` needs.
 
