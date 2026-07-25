@@ -61,6 +61,11 @@ claude
 which grim || sudo pacman -S grim
 ```
 
+Screenshots go through the first tool that works: `grim` (gamescope/wlroots,
+i.e. Gaming Mode), then `spectacle`, then `scrot`/`import`. On a Plasma desktop
+`grim` can never work — KWin advertises no screencopy protocol — so install
+`spectacle` there instead.
+
 Decky Loader must be installed — it also keeps Steam's CEF debugger enabled, which `steam_ui_eval` needs.
 
 > Not on SteamOS? That works too. The plugin resolves the desktop user from
@@ -91,7 +96,10 @@ Copy the plugin folder (containing `dist/`, `skills/`, `main.py`, `mcp_server.py
 ## Usage
 
 1. In Gaming Mode: Quick Access (⋯) → **Claude Code**.
-2. Pick a working directory, tap **Start Remote Session**.
+2. Leave **Session** on *New session* and pick a working directory, or choose a
+   past session to pick up where it left off — resuming replays the transcript
+   in the directory it was recorded in, so the working directory follows from
+   the session. Then tap **Start Remote Session** / **Resume Session**.
 3. Open the shown URL in the Claude app on your phone.
 4. Describe the problem ("downloads are stuck", "Steam won't stay logged in", "X crashes at the menu"). Claude loads the steam-debugger skill, inspects Steam from the inside, reads logs, screenshots the screen, and walks the fix with you.
 5. Stop the session from the panel when done — all injected config is cleaned up.
@@ -114,6 +122,7 @@ The panel also offers a manual screenshot preview and manual key/mouse/text inpu
 - [x] Steam UI debugging via Chrome DevTools Protocol (`steam_ui_eval`)
 - [x] Screenshot + keyboard/mouse/text MCP tools
 - [x] Bundled steam-debugger skill, autoloaded (personal copy overrides)
+- [x] Resume a past session from the panel, and see what else is running here
 - [ ] Curated `SteamClient` helper snippets (stuck downloads, login state, library refresh)
 - [ ] Log file watcher (tail Steam logs into Claude's context)
 - [ ] In-game assistance polish (game detection, per-game context) — later

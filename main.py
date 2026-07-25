@@ -7,6 +7,7 @@ import os
 import pty
 import pwd
 import re
+import uuid
 
 logger = logging.getLogger("decky-claude")
 
@@ -136,6 +137,8 @@ class Plugin:
     _session_url: str | None = None
     _status: str = "stopped"
     _working_dir: str = _USER_HOME
+    _resume_id: str = ""
+    _session_id: str = ""
     _error_msg: str | None = None
     _log_lines: list[str] = []
     _skill_name: str | None = None
@@ -161,12 +164,21 @@ class Plugin:
 
     # ── session API ────────────────────────────────────────────────────────────
 
-    async def start_session(self, working_dir: str = ""):
+    async def start_session(self, working_dir: str = "", resume_id: str = ""):
         if self._process and self._process.returncode is None:
             return {"success": False, "error": "Session already running"}
 
+        # A transcript only replays in the directory it was recorded in, so the
+        # session's own cwd wins over whatever the panel had selected.
+        if resume_id:
+            recorded = self._session_dir(resume_id)
+            if not recorded:
+                return {"success": False, "error": "That session no longer exists"}
+            working_dir = recorded
+
         working_dir = working_dir or _USER_HOME
         self._working_dir = working_dir
+        self._resume_id = resume_id
         self._session_url = None
         self._error_msg = None
         self._status = "starting"
@@ -187,17 +199,30 @@ class Plugin:
         # demands a prompt) whenever stdout isn't a TTY, so a plain pipe
         # can't be used here — give it a pty to keep it in interactive
         # remote-control mode while we still capture its output.
+        # stdin has to be the pty too: the TUI only renders when all three
+        # streams are a terminal, and with stdin on /dev/null it prints
+        # nothing at all, so the session URL never appears.
         master_fd, slave_fd = pty.openpty()
 
-        env = {**os.environ, **self._display_env()}
+        argv = [claude_bin, "--remote-control", "--mcp-config", mcp_config]
+        if resume_id:
+            argv += ["--resume", resume_id]
+            self._session_id = resume_id
+        else:
+            # Pin the id up front instead of hunting for the transcript claude
+            # picked, so the panel can point at its own session in the list.
+            self._session_id = str(uuid.uuid4())
+            argv += ["--session-id", self._session_id]
+
+        env = self._display_env()
         try:
             self._process = await asyncio.create_subprocess_exec(
-                claude_bin, "--remote-control", "--mcp-config", mcp_config,
+                *argv,
                 cwd=working_dir,
                 env=env,
                 stdout=slave_fd,
                 stderr=slave_fd,
-                stdin=asyncio.subprocess.DEVNULL,
+                stdin=slave_fd,
             )
         except Exception as exc:
             os.close(slave_fd)
@@ -252,6 +277,8 @@ class Plugin:
         self._session_url = None
         self._status = "stopped"
         self._error_msg = None
+        self._resume_id = ""
+        self._session_id = ""
         return {"success": True}
 
     async def get_status(self):
@@ -264,6 +291,7 @@ class Plugin:
             "status": self._status,
             "url": self._session_url,
             "working_dir": self._working_dir,
+            "resume_id": self._resume_id,
             "error": self._error_msg,
             "skill": self._skill_name,
         }
@@ -283,7 +311,7 @@ class Plugin:
                 claude_bin, "auth", "status", "--json",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
-                env={**os.environ, **self._display_env()},
+                env=self._display_env(),
             )
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
             data = json.loads(out.decode(errors="replace"))
@@ -318,7 +346,7 @@ class Plugin:
             self._login_proc = await asyncio.create_subprocess_exec(
                 claude_bin, "auth", "login",
                 cwd=_USER_HOME,
-                env={**os.environ, **self._display_env()},
+                env=self._display_env(),
                 stdout=slave_fd,
                 stderr=slave_fd,
                 stdin=slave_fd,
@@ -428,12 +456,78 @@ class Plugin:
                 "short_id": session_id[:8],
                 "cwd": cwd,
                 "label": os.path.basename(cwd.rstrip("/")) or cwd,
+                "preview": self._session_preview(path, mtime),
                 "mtime": int(mtime),
                 "live": cwd in live,
-                "current": os.path.realpath(cwd) == os.path.realpath(self._working_dir)
-                and self._status == "running",
+                "current": session_id == self._session_id and self._status == "running",
             })
         return {"sessions": sessions}
+
+    _preview_cache: dict = {}
+
+    @classmethod
+    def _session_preview(cls, path: str, mtime: float) -> str:
+        """First thing the user asked in that session — the only practical way
+        to tell two sessions in the same directory apart when picking one to
+        resume. Cached on mtime because the panel polls this list.
+        """
+        cached = cls._preview_cache.get(path)
+        if cached and cached[0] == mtime:
+            return cached[1]
+
+        preview = ""
+        try:
+            with open(path, "r", errors="replace") as f:
+                for _ in range(400):
+                    line = f.readline()
+                    if not line:
+                        break
+                    if '"user"' not in line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if record.get("type") != "user":
+                        continue
+                    content = (record.get("message") or {}).get("content")
+                    if isinstance(content, list):
+                        content = next(
+                            (b.get("text") for b in content
+                             if isinstance(b, dict) and b.get("type") == "text"),
+                            None,
+                        )
+                    if not isinstance(content, str):
+                        continue
+                    text = " ".join(content.split())
+                    # Skip the synthetic openers (command stdout, hook output,
+                    # caveats) that would otherwise become every session's title.
+                    if not text or text.startswith("<") or text.startswith("Caveat:"):
+                        continue
+                    preview = text[:70]
+                    break
+        except OSError:
+            pass
+
+        cls._preview_cache[path] = (mtime, preview)
+        return preview
+
+    def _session_dir(self, session_id: str) -> str | None:
+        """Directory a past session was recorded in, or None if it's gone.
+
+        `claude --resume <id>` only finds a transcript when it is started in the
+        same cwd, because that is what selects the ~/.claude/projects bucket.
+        """
+        root = os.path.join(_USER_HOME, ".claude", "projects")
+        try:
+            projects = os.listdir(root)
+        except OSError:
+            return None
+        for project in projects:
+            path = os.path.join(root, project, f"{session_id}.jsonl")
+            if os.path.isfile(path):
+                return self._session_cwd(path) or self._decode_project_dir(project)
+        return None
 
     @staticmethod
     def _decode_project_dir(name: str) -> str:
@@ -552,10 +646,23 @@ class Plugin:
     # ── working-dir setup / teardown ───────────────────────────────────────────
 
     def _trust_working_dir(self, working_dir: str) -> None:
-        """Pre-accept the workspace trust dialog for working_dir, mirroring
-        what answering 'Yes, I trust this folder' does. Needed because the
-        remote-control session has no local TTY to answer the prompt on."""
-        config_path = os.path.expanduser("~/.claude.json")
+        """Pre-answer the two startup prompts that would otherwise block.
+
+        A remote-control session has no local TTY, so anything claude asks
+        before printing its URL is unanswerable and the session just hangs:
+
+        1. The workspace trust dialog ("Yes, I trust this folder").
+        2. The MCP approval prompt, because we write a .mcp.json declaring the
+           `steamdeck` server. Listing it in enabledMcpjsonServers is what
+           choosing "Use this and all future MCP servers in this project"
+           records.
+
+        Uses the resolved home rather than expanduser("~"): the backend
+        inherits HOME=/root from the root-launched loader service, which would
+        write these flags to /root/.claude.json while the claude we spawn reads
+        the desktop user's copy — leaving the session stuck with no output.
+        """
+        config_path = os.path.join(_USER_HOME, ".claude.json")
         try:
             with open(config_path) as f:
                 config = json.load(f)
@@ -565,9 +672,14 @@ class Plugin:
         projects = config.setdefault("projects", {})
         real_dir = os.path.realpath(working_dir)
         entry = projects.setdefault(real_dir, {})
-        if entry.get("hasTrustDialogAccepted"):
+
+        enabled = entry.setdefault("enabledMcpjsonServers", [])
+        mcp_approved = "steamdeck" in enabled
+        if entry.get("hasTrustDialogAccepted") and mcp_approved:
             return
         entry["hasTrustDialogAccepted"] = True
+        if not mcp_approved:
+            enabled.append("steamdeck")
 
         tmp_path = config_path + ".tmp"
         try:
@@ -735,48 +847,76 @@ class Plugin:
     # ── private helpers ────────────────────────────────────────────────────────
 
     def _display_env(self) -> dict[str, str]:
-        """Environment overlay for every child process we spawn.
+        """Complete environment for every child process we spawn.
 
-        plugin_loader.service runs as root, so children inherit HOME=/root even
-        though Decky drops the plugin to the desktop user's uid. `claude` then
-        looks for credentials under /root, finds none, and reports itself
-        logged out — which also makes `--remote-control` exit before printing a
-        session URL. Pin HOME/USER to the resolved desktop user so the CLI
-        reads the right config regardless of how the service was launched.
+        Returns a full environment rather than an overlay, because two of the
+        things it has to do are *remove* inherited variables.
+
+        1. plugin_loader.service runs as root, so children inherit HOME=/root
+           even though Decky drops the plugin to the desktop user's uid.
+           `claude` then looks for credentials under /root, finds none, and
+           reports itself logged out — which also makes `--remote-control` exit
+           before printing a session URL.
+        2. Decky Loader is a PyInstaller bundle whose bootloader points
+           LD_LIBRARY_PATH at its extraction dir (/tmp/_MEIxxxxxx). That dir
+           ships an older libreadline.so.8, so any child that shells out dies
+           with "sh: symbol lookup error: undefined symbol:
+           rl_trim_arg_from_keyseq". claude shells out internally, so this
+           killed every session before it could print a URL.
         """
-        # uid 1000 is the SteamOS default but not universal, so derive the
-        # runtime dir from the resolved desktop user instead of hardcoding it.
-        runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{_USER_UID}"
-        env: dict[str, str] = {
-            "XDG_RUNTIME_DIR": runtime_dir,
-            "HOME": _USER_HOME,
-        }
+        env = dict(os.environ)
+
+        # Drop the bundle's loader paths so children link system libraries.
+        orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if orig:
+            env["LD_LIBRARY_PATH"] = orig
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+        env.pop("_PYI_APPLICATION_HOME_DIR", None)
+
+        env["HOME"] = _USER_HOME
         try:
             env["USER"] = env["LOGNAME"] = pwd.getpwuid(_USER_UID).pw_name
         except KeyError:
             pass
+
+        # uid 1000 is the SteamOS default but not universal, so derive the
+        # runtime dir from the resolved desktop user instead of hardcoding it.
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{_USER_UID}"
+        env["XDG_RUNTIME_DIR"] = runtime_dir
         for wd in ["wayland-0", "wayland-1", "wayland-2"]:
             if os.path.exists(os.path.join(runtime_dir, wd)):
                 env["WAYLAND_DISPLAY"] = wd
                 break
         env.setdefault("DISPLAY", ":0")
+        # spectacle (the KWin screenshot path) talks to the compositor over the
+        # session bus rather than a Wayland protocol, so it needs the address.
+        env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={runtime_dir}/bus")
         return env
 
     async def _take_screenshot(self, out_path: str) -> dict:
-        env = {**os.environ, **self._display_env()}
-        for cmd in [
-            ["grim", out_path],
-            ["scrot", out_path],
-            ["import", "-window", "root", out_path],
+        env = self._display_env()
+        # grim covers gamescope/wlroots, i.e. Gaming Mode. KWin advertises no
+        # screencopy protocol at all, so on a Plasma desktop only spectacle can
+        # capture — it drives KWin's own D-Bus interface. Being a Qt app it is
+        # slow to start, hence the longer timeout. scrot/import are X11.
+        for cmd, timeout in [
+            (["grim", out_path], 10),
+            (["spectacle", "-f", "-b", "-n", "-o", out_path], 25),
+            (["scrot", "-o", out_path], 10),
+            (["import", "-window", "root", out_path], 10),
         ]:
-            r = await self._run_cmd(cmd, env)
-            if r["success"] and os.path.exists(out_path):
+            r = await self._run_cmd(cmd, env, timeout=timeout)
+            if r["success"] and os.path.exists(out_path) and os.path.getsize(out_path):
                 return {"success": True, "path": out_path}
-        return {"success": False, "error": "No screenshot tool available (grim/scrot/import)"}
+        return {
+            "success": False,
+            "error": "No working screenshot tool (tried grim/spectacle/scrot/import)",
+        }
 
     async def _make_thumb(self, src: str) -> str | None:
         thumb = src.replace(".png", "_thumb.png")
-        env = {**os.environ, **self._display_env()}
+        env = self._display_env()
         for cmd in [["grim", "-s", "0.3", thumb], ["convert", "-resize", "30%", src, thumb]]:
             r = await self._run_cmd(cmd, env)
             if r["success"] and os.path.exists(thumb):
@@ -788,21 +928,29 @@ class Plugin:
         except OSError:
             return None
 
-    async def _run_cmd(self, cmd: list, env: dict | None = None) -> dict:
+    async def _run_cmd(self, cmd: list, env: dict | None = None, timeout: float = 8) -> dict:
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, **(env or {})},
+                env={**self._display_env(), **(env or {})},
             )
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=8)
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             if proc.returncode == 0:
                 return {"success": True}
             return {"success": False, "error": stderr.decode(errors="replace").strip()}
         except FileNotFoundError:
             return {"success": False, "error": f"{cmd[0]} not found"}
         except asyncio.TimeoutError:
+            # wait_for only cancels the wait, so kill the child as well —
+            # a GUI tool like spectacle would otherwise linger forever.
+            if proc and proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
             return {"success": False, "error": "command timed out"}
 
     async def _find_claude(self) -> str | None:
@@ -811,7 +959,7 @@ class Plugin:
                 "which", "claude",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
-                env={**os.environ, **self._display_env()},
+                env=self._display_env(),
             )
             out, _ = await proc.communicate()
             if proc.returncode == 0:

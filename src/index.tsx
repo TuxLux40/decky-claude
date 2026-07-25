@@ -1,6 +1,8 @@
 import {
   ButtonItem,
+  DialogButton,
   DropdownItem,
+  Focusable,
   PanelSection,
   PanelSectionRow,
   staticClasses,
@@ -15,13 +17,20 @@ import qrcode from "qrcode-generator";
 // ── backend callables ──────────────────────────────────────────────────────────
 
 const startSession = callable<
-  [string],
+  [string, string],
   { success: boolean; url?: string; error?: string }
 >("start_session");
 const stopSession = callable<[], { success: boolean }>("stop_session");
 const getStatus = callable<
   [],
-  { status: string; url?: string; working_dir: string; error?: string; skill?: string | null }
+  {
+    status: string;
+    url?: string;
+    working_dir: string;
+    resume_id?: string;
+    error?: string;
+    skill?: string | null;
+  }
 >("get_status");
 const listDirs = callable<[], { dirs: string[] }>("list_dirs");
 
@@ -60,6 +69,7 @@ interface MachineSession {
   short_id: string;
   cwd: string;
   label: string;
+  preview: string;
   mtime: number;
   live: boolean;
   current: boolean;
@@ -140,6 +150,8 @@ function Content() {
 
   // other sessions on this machine
   const [machineSessions, setMachineSessions] = useState<MachineSession[]>([]);
+  // "" = start a fresh session; otherwise the transcript id to resume
+  const [resumeId, setResumeId] = useState("");
 
   // screen
   const [thumbnail, setThumbnail] = useState<string | null>(null);
@@ -226,6 +238,9 @@ function Content() {
     setStatus(r.status as SessionStatus);
     setSessionUrl(r.url ?? null);
     setSkill(r.skill ?? null);
+    // A session started before the panel was opened still has to show what it
+    // is resuming, so the backend's value wins while one is running.
+    if (r.status === "running" || r.status === "starting") setResumeId(r.resume_id ?? "");
     if (r.error) setSessionError(r.error);
   }
 
@@ -234,7 +249,7 @@ function Content() {
     setSessionLoading(true);
     setSessionError(null);
     try {
-      const r = await startSession(workingDir);
+      const r = await startSession(workingDir, resumeId);
       if (r.success) {
         setStatus("running");
         setSessionUrl(r.url ?? null);
@@ -254,6 +269,7 @@ function Content() {
       setStatus("stopped");
       setSessionUrl(null);
       setSessionError(null);
+      setResumeId("");
     } finally {
       setSessionLoading(false);
     }
@@ -311,6 +327,10 @@ function Content() {
   }
 
   const isRunning = status === "running" || status === "starting";
+  // A live session is already attached to a claude process; resuming it a
+  // second time would run two clients against one transcript.
+  const resumable = machineSessions.filter((s) => !s.live);
+  const resumeSession = machineSessions.find((s) => s.id === resumeId) ?? null;
   const statusColor = STATUS_COLOR[status] ?? "#888";
   const statusLabel =
     status === "starting" ? "Starting…" : status.charAt(0).toUpperCase() + status.slice(1);
@@ -454,15 +474,41 @@ function Content() {
         )}
 
         {!isRunning && (
-          <PanelSectionRow>
-            <DropdownItem
-              label="Working Directory"
-              description={workingDir}
-              rgOptions={dirs.map((d) => ({ data: d, label: d }))}
-              selectedOption={workingDir}
-              onChange={(opt) => setWorkingDir(opt.data)}
-            />
-          </PanelSectionRow>
+          <>
+            <PanelSectionRow>
+              <DropdownItem
+                label="Session"
+                description={
+                  resumeSession
+                    ? resumeSession.preview || `in ${resumeSession.cwd}`
+                    : "Starts a fresh conversation"
+                }
+                rgOptions={[
+                  { data: "", label: "New session" },
+                  ...resumable.map((s) => ({
+                    data: s.id,
+                    label: `${s.label} · ${relativeTime(s.mtime)}`,
+                  })),
+                ]}
+                selectedOption={resumeId}
+                onChange={(opt) => setResumeId(opt.data)}
+              />
+            </PanelSectionRow>
+
+            {/* Resuming replays a transcript, and that only works in the
+                directory it was recorded in — so the backend picks the cwd. */}
+            {!resumeId && (
+              <PanelSectionRow>
+                <DropdownItem
+                  label="Working Directory"
+                  description={workingDir}
+                  rgOptions={dirs.map((d) => ({ data: d, label: d }))}
+                  selectedOption={workingDir}
+                  onChange={(opt) => setWorkingDir(opt.data)}
+                />
+              </PanelSectionRow>
+            )}
+          </>
         )}
 
         <PanelSectionRow>
@@ -473,7 +519,9 @@ function Content() {
           >
             {sessionLoading
               ? isRunning ? "Stopping…" : "Starting…"
-              : isRunning ? "Stop Session" : "Start Remote Session"}
+              : isRunning ? "Stop Session"
+              : resumeId ? "Resume Session"
+              : "Start Remote Session"}
           </ButtonItem>
         </PanelSectionRow>
 
@@ -496,38 +544,65 @@ function Content() {
       {/* ── Sessions on this machine ───────────────────────────────────── */}
       {machineSessions.length > 0 && (
         <PanelSection title="Sessions on this device">
-          {machineSessions.map((s) => (
-            <PanelSectionRow key={s.id}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, width: "100%" }}>
-                <div
+          {machineSessions.map((s) => {
+            const selected = s.id === resumeId;
+            const selectable = !s.live && !isRunning;
+            return (
+              <PanelSectionRow key={s.id}>
+                <DialogButton
+                  // Rows are buttons rather than divs so the D-pad can reach
+                  // them: the Quick Access panel scrolls to whatever has focus,
+                  // and unfocusable content is a dead end for gamepad users.
+                  onClick={() => selectable && setResumeId(selected ? "" : s.id)}
                   style={{
-                    width: 8, height: 8, borderRadius: "50%", flexShrink: 0,
-                    background: s.live ? "#4caf50" : "#555",
-                    boxShadow: s.live ? "0 0 6px #4caf50" : "none",
+                    width: "100%", minWidth: 0, padding: "6px 8px",
+                    textAlign: "left", display: "flex", alignItems: "center", gap: 8,
+                    background: selected ? "rgba(91,163,245,0.18)" : "rgba(255,255,255,0.04)",
+                    border: selected
+                      ? "1px solid rgba(91,163,245,0.6)"
+                      : "1px solid transparent",
                   }}
-                />
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{
-                    fontSize: 12, fontWeight: s.current ? 700 : 500,
-                    color: s.current ? "#5ba3f5" : "#ddd",
-                    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                  }}>
-                    {s.label}{s.current ? " (this panel)" : ""}
+                >
+                  <div
+                    style={{
+                      width: 8, height: 8, borderRadius: "50%", flexShrink: 0,
+                      background: s.live ? "#4caf50" : "#555",
+                      boxShadow: s.live ? "0 0 6px #4caf50" : "none",
+                    }}
+                  />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{
+                      fontSize: 12, fontWeight: s.current ? 700 : 500,
+                      color: s.current ? "#5ba3f5" : "#ddd",
+                      overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                    }}>
+                      {s.label}{s.current ? " (this panel)" : ""}
+                    </div>
+                    {s.preview && (
+                      <div style={{
+                        fontSize: 10, color: "#9aa",
+                        overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                      }}>
+                        {s.preview}
+                      </div>
+                    )}
+                    <div style={{
+                      fontSize: 10, color: "#777",
+                      overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                    }}>
+                      {s.live ? "running" : relativeTime(s.mtime)} · {s.short_id}
+                      {selected ? " · will resume" : ""}
+                    </div>
                   </div>
-                  <div style={{
-                    fontSize: 10, color: "#777",
-                    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                  }}>
-                    {s.live ? "running" : relativeTime(s.mtime)} · {s.short_id}
-                  </div>
-                </div>
-              </div>
-            </PanelSectionRow>
-          ))}
+                </DialogButton>
+              </PanelSectionRow>
+            );
+          })}
           <PanelSectionRow>
             <div style={{ fontSize: 10, color: "#666", lineHeight: 1.4 }}>
-              Green means a claude process is live in that directory. Open it from
-              the Claude app — remote control is always on for new sessions.
+              Green means a claude process is live in that directory — open those
+              from the Claude app. Pick any other one to resume it here, then hit
+              Resume Session.
             </div>
           </PanelSectionRow>
         </PanelSection>
@@ -579,78 +654,53 @@ function Content() {
           </div>
         </PanelSectionRow>
 
+        {/* Plain <button>/<input> are invisible to Steam's gamepad focus
+            system: the D-pad cannot enter them, and because the Quick Access
+            panel scrolls by following focus, everything below them becomes
+            unreachable. Use Decky's focusable primitives instead. */}
         <PanelSectionRow>
-          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          <Focusable style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
             {QUICK_KEYS.map(({ label, key }) => (
-              <button
+              <DialogButton
                 key={key}
                 onClick={() => handleKey(key)}
-                style={{
-                  background: "rgba(255,255,255,0.1)",
-                  border: "1px solid rgba(255,255,255,0.2)",
-                  borderRadius: 6, color: "#fff",
-                  padding: "4px 10px", fontSize: 12,
-                  cursor: "pointer", flex: "1 1 auto",
-                }}
+                style={{ flex: "1 1 auto", minWidth: 0, padding: "6px 10px", fontSize: 12 }}
               >
                 {label}
-              </button>
+              </DialogButton>
             ))}
-          </div>
+          </Focusable>
         </PanelSectionRow>
 
         <PanelSectionRow>
-          <div style={{ display: "flex", gap: 6 }}>
+          <Focusable style={{ display: "flex", gap: 6 }}>
             {[{ label: "Left Click", btn: 1 }, { label: "Right Click", btn: 3 }].map(
               ({ label, btn }) => (
-                <button
+                <DialogButton
                   key={btn}
                   onClick={() => handleClick(btn)}
-                  style={{
-                    background: "rgba(255,255,255,0.1)",
-                    border: "1px solid rgba(255,255,255,0.2)",
-                    borderRadius: 6, color: "#fff",
-                    padding: "4px 10px", fontSize: 12,
-                    cursor: "pointer", flex: 1,
-                  }}
+                  style={{ flex: 1, minWidth: 0, padding: "6px 10px", fontSize: 12 }}
                 >
                   {label}
-                </button>
+                </DialogButton>
               )
             )}
-          </div>
+          </Focusable>
         </PanelSectionRow>
 
         <PanelSectionRow>
-          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-            <input
-              type="text"
-              value={typeText}
-              onChange={(e) => setTypeText(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleType()}
-              placeholder="Type text…"
-              style={{
-                flex: 1,
-                background: "rgba(255,255,255,0.07)",
-                border: "1px solid rgba(255,255,255,0.2)",
-                borderRadius: 6, color: "#fff",
-                padding: "5px 8px", fontSize: 12,
-              }}
-            />
-            <button
-              onClick={handleType}
-              disabled={!typeText}
-              style={{
-                background: typeText ? "rgba(91,163,245,0.3)" : "rgba(255,255,255,0.05)",
-                border: "1px solid rgba(91,163,245,0.4)",
-                borderRadius: 6, color: "#fff",
-                padding: "5px 12px", fontSize: 12,
-                cursor: typeText ? "pointer" : "default",
-              }}
-            >
-              Send
-            </button>
-          </div>
+          <TextField
+            label="Text to type"
+            bShowClearAction
+            value={typeText}
+            onChange={(e) => setTypeText(e.target.value)}
+          />
+        </PanelSectionRow>
+
+        <PanelSectionRow>
+          <ButtonItem layout="below" disabled={!typeText} onClick={handleType}>
+            Send Text
+          </ButtonItem>
         </PanelSectionRow>
 
         {inputFeedback && (

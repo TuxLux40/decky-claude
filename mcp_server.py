@@ -32,26 +32,16 @@ def _display_env() -> dict[str, str]:
             env.setdefault("WAYLAND_DISPLAY", wd)
             break
     env.setdefault("DISPLAY", ":0")
+    # Needed by the desktop-session screenshot fallbacks (spectacle talks to
+    # the compositor over the session bus, not over a Wayland protocol).
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={runtime_dir}/bus")
     return env
 
-def _run(cmd: list[str]) -> tuple[int, str]:
+def _run(cmd: list[str], timeout: float = 10) -> tuple[int, str]:
     env = _display_env()
     try:
-        r = subprocess.run(
-            cmd, env=env, capture_output=True, timeout=10,
-            # If running as root, try to run display commands as the deck user
-            **({"user": "deck"} if os.getuid() == 0 and cmd[0] in ("grim", "scrot", "import", "xdotool") else {}),
-        )
+        r = subprocess.run(cmd, env=env, capture_output=True, timeout=timeout)
         return r.returncode, r.stderr.decode(errors="replace").strip()
-    except TypeError:
-        # 'user' kwarg not available on older Python / this platform, retry without
-        try:
-            r = subprocess.run(cmd, env=env, capture_output=True, timeout=10)
-            return r.returncode, r.stderr.decode(errors="replace").strip()
-        except FileNotFoundError:
-            return 1, f"{cmd[0]} not found"
-        except subprocess.TimeoutExpired:
-            return 1, "timeout"
     except FileNotFoundError:
         return 1, f"{cmd[0]} not found"
     except subprocess.TimeoutExpired:
@@ -291,17 +281,38 @@ _KEY_MAP = {
 }
 
 
+def SCREENSHOT_COMMANDS(path: str) -> list[tuple[list[str], float]]:
+    """Capture commands to try, in order, with a per-command timeout.
+
+    grim covers gamescope and wlroots-style compositors, which is Gaming Mode
+    and therefore the common case. KWin (Plasma desktop, and Big Picture run
+    from a normal desktop session) advertises no screencopy protocol at all, so
+    grim can never work there — spectacle goes through KWin's own D-Bus
+    interface instead and is the only thing that does. It shells out to a Qt
+    app, so it needs a much longer leash than a one-shot capture binary.
+    scrot/import are the X11 fallbacks.
+    """
+    return [
+        (["grim", path], 10),
+        (["spectacle", "-f", "-b", "-n", "-o", path], 25),
+        (["scrot", "-o", path], 10),
+        (["import", "-window", "root", path], 10),
+    ]
+
+
+SCREENSHOT_UNAVAILABLE = (
+    "Screenshot failed — no working capture tool "
+    "(tried grim / spectacle / scrot / import)."
+)
+
+
 def _handle_screenshot() -> list[dict]:
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         path = f.name
 
     captured = False
-    for cmd in [
-        ["grim", path],
-        ["scrot", path],
-        ["import", "-window", "root", path],
-    ]:
-        rc, _ = _run(cmd)
+    for cmd, timeout in SCREENSHOT_COMMANDS(path):
+        rc, _ = _run(cmd, timeout=timeout)
         if rc == 0 and os.path.exists(path) and os.path.getsize(path) > 0:
             captured = True
             break
@@ -309,7 +320,7 @@ def _handle_screenshot() -> list[dict]:
     if not captured:
         if os.path.exists(path):
             os.unlink(path)
-        return [{"type": "text", "text": "Screenshot failed — no tool available (grim / scrot / import)."}]
+        return [{"type": "text", "text": SCREENSHOT_UNAVAILABLE}]
 
     with open(path, "rb") as f:
         data = base64.standard_b64encode(f.read()).decode()
