@@ -884,10 +884,25 @@ class Plugin:
         # runtime dir from the resolved desktop user instead of hardcoding it.
         runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{_USER_UID}"
         env["XDG_RUNTIME_DIR"] = runtime_dir
+
+        # Gaming Mode is a gamescope session, not a desktop one, and its socket
+        # is gamescope-N — a wayland-N probe alone never finds it. gamescopectl
+        # reads GAMESCOPE_WAYLAND_DISPLAY to reach the control protocol.
+        gamescope_socket = next(
+            (s for s in ("gamescope-0", "gamescope-1")
+             if os.path.exists(os.path.join(runtime_dir, s))),
+            None,
+        )
+        if gamescope_socket:
+            env.setdefault("GAMESCOPE_WAYLAND_DISPLAY", gamescope_socket)
+
         for wd in ["wayland-0", "wayland-1", "wayland-2"]:
             if os.path.exists(os.path.join(runtime_dir, wd)):
                 env["WAYLAND_DISPLAY"] = wd
                 break
+        else:
+            if gamescope_socket:
+                env["WAYLAND_DISPLAY"] = gamescope_socket
         env.setdefault("DISPLAY", ":0")
         # spectacle (the KWin screenshot path) talks to the compositor over the
         # session bus rather than a Wayland protocol, so it needs the address.
@@ -896,22 +911,41 @@ class Plugin:
 
     async def _take_screenshot(self, out_path: str) -> dict:
         env = self._display_env()
-        # grim covers gamescope/wlroots, i.e. Gaming Mode. KWin advertises no
-        # screencopy protocol at all, so on a Plasma desktop only spectacle can
-        # capture — it drives KWin's own D-Bus interface. Being a Qt app it is
-        # slow to start, hence the longer timeout. scrot/import are X11.
-        for cmd, timeout in [
+        # Gaming Mode first, because that is what this plugin is for. Neither
+        # gamescope nor KWin implements a Wayland screencopy protocol, so grim
+        # works in neither of them and each session needs its own native path:
+        # gamescopectl drives gamescope's control protocol, spectacle drives
+        # KWin's D-Bus interface. grim still covers plain wlroots compositors,
+        # and scrot/import cover X11.
+        candidates = []
+        # Only when a gamescope socket was actually found: outside Gaming Mode
+        # gamescopectl still exits 0 after failing to connect, so an ungated
+        # attempt would cost the file-wait below on every desktop capture.
+        if env.get("GAMESCOPE_WAYLAND_DISPLAY"):
+            candidates.append((["gamescopectl", "screenshot", out_path], 15))
+        candidates += [
             (["grim", out_path], 10),
             (["spectacle", "-f", "-b", "-n", "-o", out_path], 25),
             (["scrot", "-o", out_path], 10),
             (["import", "-window", "root", out_path], 10),
-        ]:
+        ]
+
+        for cmd, timeout in candidates:
             r = await self._run_cmd(cmd, env, timeout=timeout)
-            if r["success"] and os.path.exists(out_path) and os.path.getsize(out_path):
-                return {"success": True, "path": out_path}
+            if not r["success"]:
+                continue
+            # gamescope writes the file from its own render thread, so it can
+            # land slightly after the command returns.
+            for _ in range(20):
+                if os.path.exists(out_path) and os.path.getsize(out_path):
+                    return {"success": True, "path": out_path}
+                await asyncio.sleep(0.1)
         return {
             "success": False,
-            "error": "No working screenshot tool (tried grim/spectacle/scrot/import)",
+            "error": (
+                "No working screenshot tool "
+                "(tried gamescopectl/grim/spectacle/scrot/import)"
+            ),
         }
 
     async def _make_thumb(self, src: str) -> str | None:

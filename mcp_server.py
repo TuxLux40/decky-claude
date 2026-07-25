@@ -35,6 +35,13 @@ def _display_env() -> dict[str, str]:
     # Needed by the desktop-session screenshot fallbacks (spectacle talks to
     # the compositor over the session bus, not over a Wayland protocol).
     env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={runtime_dir}/bus")
+    # Gaming Mode's socket is gamescope-N, which the wayland-N probe above
+    # never matches; gamescopectl reads this to find the control protocol.
+    for gs in ("gamescope-0", "gamescope-1"):
+        if os.path.exists(os.path.join(runtime_dir, gs)):
+            env.setdefault("GAMESCOPE_WAYLAND_DISPLAY", gs)
+            env.setdefault("WAYLAND_DISPLAY", gs)
+            break
     return env
 
 def _run(cmd: list[str], timeout: float = 10) -> tuple[int, str]:
@@ -281,18 +288,23 @@ _KEY_MAP = {
 }
 
 
-def SCREENSHOT_COMMANDS(path: str) -> list[tuple[list[str], float]]:
+def SCREENSHOT_COMMANDS(path: str, env: dict[str, str]) -> list[tuple[list[str], float]]:
     """Capture commands to try, in order, with a per-command timeout.
 
-    grim covers gamescope and wlroots-style compositors, which is Gaming Mode
-    and therefore the common case. KWin (Plasma desktop, and Big Picture run
-    from a normal desktop session) advertises no screencopy protocol at all, so
-    grim can never work there — spectacle goes through KWin's own D-Bus
-    interface instead and is the only thing that does. It shells out to a Qt
-    app, so it needs a much longer leash than a one-shot capture binary.
-    scrot/import are the X11 fallbacks.
+    Gaming Mode comes first, because that is what this plugin is for. Neither
+    gamescope nor KWin implements a Wayland screencopy protocol, so grim works
+    in neither of them and each session needs its own native path: gamescopectl
+    speaks gamescope's control protocol, spectacle drives KWin's D-Bus
+    interface (a Qt app, hence the much longer leash). grim still covers plain
+    wlroots compositors, and scrot/import cover X11.
     """
-    return [
+    commands = []
+    # Only when a gamescope socket was actually found: outside Gaming Mode
+    # gamescopectl still exits 0 after failing to connect, so an ungated attempt
+    # would just burn the file-existence check on every desktop capture.
+    if env.get("GAMESCOPE_WAYLAND_DISPLAY"):
+        commands.append((["gamescopectl", "screenshot", path], 15))
+    return commands + [
         (["grim", path], 10),
         (["spectacle", "-f", "-b", "-n", "-o", path], 25),
         (["scrot", "-o", path], 10),
@@ -302,7 +314,7 @@ def SCREENSHOT_COMMANDS(path: str) -> list[tuple[list[str], float]]:
 
 SCREENSHOT_UNAVAILABLE = (
     "Screenshot failed — no working capture tool "
-    "(tried grim / spectacle / scrot / import)."
+    "(tried gamescopectl / grim / spectacle / scrot / import)."
 )
 
 
@@ -311,7 +323,7 @@ def _handle_screenshot() -> list[dict]:
         path = f.name
 
     captured = False
-    for cmd, timeout in SCREENSHOT_COMMANDS(path):
+    for cmd, timeout in SCREENSHOT_COMMANDS(path, _display_env()):
         rc, _ = _run(cmd, timeout=timeout)
         if rc == 0 and os.path.exists(path) and os.path.getsize(path) > 0:
             captured = True
