@@ -267,6 +267,30 @@ TOOLS = [
     },
 ]
 
+
+def _register_snippet_tool() -> None:
+    """Declared after SNIPPETS exists so the catalog is in the description —
+    the model should be able to pick a snippet without a second round trip."""
+    TOOLS.append({
+        "name": "steam_snippet",
+        "description": (
+            "Run a curated, pre-verified SteamClient query for a common Steam "
+            "problem. Prefer this over hand-writing steam_ui_eval JavaScript: "
+            "several namespaces (Downloads above all) expose no getters, only "
+            "RegisterFor* callbacks, so the obvious expression returns nothing. "
+            "These snippets already handle that and return structured JSON.\n\n"
+            "Snippets marked [ACTION] change client state; everything else is "
+            "read-only.\n\n" + _snippet_catalog()
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "enum": list(SNIPPETS)},
+            },
+            "required": ["name"],
+        },
+    })
+
 # ── tool handlers ──────────────────────────────────────────────────────────────
 
 
@@ -402,6 +426,160 @@ def _handle_steam_ui_eval(expression: str, target: str) -> list[dict]:
     return [{"type": "text", "text": out}]
 
 
+# ── curated SteamClient snippets ───────────────────────────────────────────────
+
+# Several SteamClient namespaces expose no getters at all — Downloads, for
+# instance, is only RegisterFor* callbacks. The registration fires once with the
+# current state, so the read is "subscribe, take the first payload, unsubscribe"
+# rather than a call. Callbacks vary in arity, hence the (...a) collection.
+_JS_PREAMBLE = """
+const once = (reg, ms = 2500) => new Promise(res => {
+  let h;
+  const done = v => { try { h && h.unregister && h.unregister(); } catch (e) {} res(v); };
+  h = reg((...a) => done(a.length > 1 ? a : a[0]));
+  setTimeout(() => done(null), ms);
+});
+const gb = n => Math.round((Number(n) || 0) / 1073741824 * 10) / 10;
+"""
+
+SNIPPETS: dict[str, dict] = {
+    "downloads": {
+        "summary": "Download queue: what is downloading, paused, queued or errored, and why it may be stuck.",
+        "js": """
+const ov = await once(cb => SteamClient.Downloads.RegisterForDownloadOverview(cb));
+const di = await once(cb => SteamClient.Downloads.RegisterForDownloadItems(cb));
+const items = (Array.isArray(di) ? di[1] : []) || [];
+const flat = items.flatMap(g => (g.item_data || []).map(d => ({
+  appid: d.appid, active: d.active, paused: d.paused, completed: d.completed,
+  queue_index: d.queue_index, update_error: d.update_error || null,
+  buildid: d.buildid, target_buildid: d.target_buildid,
+  // A build id that already matches the target with an update still pending is
+  // the classic "stuck at 100%" / needs-verification shape.
+  stalled_reason:
+    d.update_error ? 'update_error: ' + d.update_error
+    : d.paused ? 'paused'
+    : (d.queue_index === -1 && !d.active && !d.completed) ? 'deferred / not queued'
+    : (d.active && ov && ov.update_network_bytes_per_second === 0) ? 'active but 0 B/s'
+    : null,
+})));
+return ({
+  overview: ov && {
+    state: ov.update_state, appid: ov.update_appid,
+    net_bytes_per_sec: ov.update_network_bytes_per_second,
+    disk_bytes_per_sec: ov.update_disc_bytes_per_second,
+    paused_by_user: !!(ov.update_state_flags & 1),
+  },
+  items: flat,
+  stalled: flat.filter(d => d.stalled_reason),
+});
+""",
+    },
+    "login": {
+        "summary": "Login and connection state: accounts, login stage, whether the client is actually talking to Steam, reconnect throttling.",
+        "js": """
+const users = await SteamClient.User.GetLoginUsers();
+const cm = (typeof App !== 'undefined' && App.m_cm) || {};
+const now = Date.now() / 1000;
+return ({
+  login_state: typeof App !== 'undefined' ? App.m_eLoginState : null,
+  services_initialised: typeof App !== 'undefined' ? App.m_bServicesInitialized : null,
+  connected_to_steam: typeof cm.BConnectedToServer === 'function' ? cm.BConnectedToServer() : cm.m_bConnected,
+  connection_failed: !!cm.m_bConnectionFailed,
+  completed_initial_connect: !!cm.m_bCompletedInitialConnect,
+  // Non-zero means the client is deliberately waiting before retrying, which
+  // looks identical to "offline" in the UI.
+  reconnect_throttled_for_sec: cm.m_rtReconnectThrottleExpiration
+    ? Math.max(0, Math.round(cm.m_rtReconnectThrottleExpiration - now)) : 0,
+  ip_country: await SteamClient.User.GetIPCountry(),
+  secure_computer: await SteamClient.Auth.IsSecureComputer(),
+  accounts: (users || []).map(u => ({
+    account: u.accountName, persona: u.personaName,
+    remembered: u.rememberPassword, has_pin: u.hasPin,
+  })),
+});
+""",
+    },
+    "library": {
+        "summary": "Library folders with capacity and free space, plus the largest installed apps per folder — for disk-full and missing-game problems.",
+        "js": """
+const folders = await SteamClient.InstallFolder.GetInstallFolders();
+return ((folders || []).map(f => ({
+  index: f.nFolderIndex, path: f.strFolderPath, drive: f.strDriveName,
+  mounted: f.bIsMounted, is_default: f.bIsDefaultFolder,
+  capacity_gb: gb(f.nCapacity), free_gb: gb(f.nFreeSpace), used_gb: gb(f.nUsedSize),
+  shader_cache_gb: gb(f.nShaderSize), staged_gb: gb(f.nStagedSize),
+  app_count: (f.vecApps || []).length,
+  largest_apps: (f.vecApps || [])
+    .slice().sort((a, b) => (b.nUsedSize || 0) - (a.nUsedSize || 0)).slice(0, 8)
+    .map(a => ({ appid: a.nAppID, name: a.strAppName, size_gb: gb(a.nUsedSize) })),
+}))); 
+""",
+    },
+    "running": {
+        "summary": "Apps Steam currently considers running, with their install and update state.",
+        "js": """
+const ids = Array.from((typeof SteamUIStore !== 'undefined' && SteamUIStore.m_runningAppIDs) || []);
+return ({
+  running_appids: ids,
+  apps: ids.map(id => {
+    const o = appStore && appStore.GetAppOverviewByAppID
+      ? appStore.GetAppOverviewByAppID(Number(id)) : null;
+    return o ? { appid: o.appid, name: o.display_name, state: o.app_type } : { appid: id };
+  }),
+});
+""",
+    },
+    "client_info": {
+        "summary": "Steam client build/branch and OS branch — check before blaming a bug on the user.",
+        "js": """
+return ({
+  os_branch: await SteamClient.Updates.GetCurrentOSBranch(),
+  ui_mode: typeof SteamUIStore !== 'undefined' ? SteamUIStore.m_appDetailsDisplayMode : null,
+  user_agent: navigator.userAgent,
+});
+""",
+    },
+    "refresh_library": {
+        "summary": "ACTION: rescan install folders. Fixes a library that lost track of installed games.",
+        "action": True,
+        "js": """
+await SteamClient.InstallFolder.RefreshFolders();
+const folders = await SteamClient.InstallFolder.GetInstallFolders();
+return ({ refreshed: true, folders: (folders || []).length });
+""",
+    },
+    "check_updates": {
+        "summary": "ACTION: ask Steam to check for a client update.",
+        "action": True,
+        "js": """
+await SteamClient.Updates.CheckForUpdates();
+return ({ requested: true });
+""",
+    },
+}
+
+
+def _snippet_catalog() -> str:
+    return "\n".join(
+        f"- {name}{' [ACTION]' if s.get('action') else ''}: {s['summary']}"
+        for name, s in SNIPPETS.items()
+    )
+
+
+def _handle_steam_snippet(name: str) -> list[dict]:
+    snippet = SNIPPETS.get(name)
+    if not snippet:
+        raise _ToolError(
+            f"Unknown snippet {name!r}. Available: {', '.join(SNIPPETS)}"
+        )
+    return _handle_steam_ui_eval(
+        f"(async () => {{{_JS_PREAMBLE}{snippet['js']}}})()", "SharedJSContext"
+    )
+
+
+_register_snippet_tool()
+
+
 class _ToolError(Exception):
     """Unknown tool or unusable arguments — the caller's mistake, reported back
     as an error result so the model can correct itself and retry."""
@@ -435,6 +613,8 @@ def _dispatch(name: str, args: dict) -> list[dict]:
         if not isinstance(target, str):
             raise _ToolError(f"{name}: argument 'target' must be a string (got {target!r})")
         return _handle_steam_ui_eval(_require_str(name, args, "expression"), target)
+    if name == "steam_snippet":
+        return _handle_steam_snippet(_require_str(name, args, "name"))
     if name == "screenshot":
         return _handle_screenshot()
     if name == "send_key":

@@ -58,6 +58,7 @@ Everything injected into the working directory (`.mcp.json`, the `CLAUDE.md` blo
 
 | Tool | Purpose |
 |---|---|
+| `steam_snippet` | Run a curated, pre-verified SteamClient query (downloads, login, library, running, client info, refresh, updates) |
 | `steam_ui_targets` | List Steam's live UI pages (CDP targets) |
 | `steam_ui_eval` | Run JavaScript inside the Steam client (`SharedJSContext` = `SteamClient` API) |
 | `screenshot` | Capture the display, returned as a PNG image |
@@ -136,7 +137,7 @@ The panel also offers a manual screenshot preview and manual key/mouse/text inpu
 - [x] Screenshot + keyboard/mouse/text MCP tools
 - [x] Bundled steam-debugger skill, autoloaded (personal copy overrides)
 - [x] Resume a past session from the panel, and see what else is running here
-- [ ] Curated `SteamClient` helper snippets (stuck downloads, login state, library refresh)
+- [x] Curated `SteamClient` helper snippets (stuck downloads, login state, library refresh)
 - [ ] Log file watcher (tail Steam logs into Claude's context)
 - [ ] In-game assistance polish (game detection, per-game context) — later
 

@@ -12,10 +12,34 @@ description: >-
 You are debugging on a Steam Deck (SteamOS, Arch-based, immutable rootfs) in
 Gaming Mode. The primary mission is **Steam client and Steam UI problems**;
 in-game help is secondary. You have MCP tools
-(`steam_ui_targets`, `steam_ui_eval`, `screenshot`, `send_key`, `type_text`,
-`mouse_move_click`) plus normal shell access as the `deck` user.
+(`steam_snippet`, `steam_ui_targets`, `steam_ui_eval`, `screenshot`, `send_key`,
+`type_text`, `mouse_move_click`) plus normal shell access as the desktop user.
 
-## Your best tool: the Steam UI debugger
+## Start here: `steam_snippet`
+
+Before writing any JavaScript, check whether a curated snippet already answers
+the question — they are pre-verified against a live client and return
+structured JSON. `steam_snippet` takes one `name`:
+
+| Snippet | Use it for |
+|---|---|
+| `downloads` | Downloads stuck, paused, queued, erroring, or sitting at 0 B/s |
+| `login` | Won't log in, "no connection", stuck offline, reconnect throttling |
+| `library` | Disk full, missing games, where an app is installed, shader bloat |
+| `running` | What Steam currently thinks is running |
+| `client_info` | Client/OS branch, before blaming a bug on the user |
+| `refresh_library` | **Action** — rescan install folders (library lost games) |
+| `check_updates` | **Action** — ask Steam to check for a client update |
+
+This matters most for downloads: `SteamClient.Downloads` exposes **no getters**,
+only `RegisterFor*` callbacks. A natural-looking `GetDownloadItems()` does not
+exist, and the real pattern — subscribe, take the first payload, unsubscribe —
+is easy to get wrong and silently returns nothing. The snippet handles it.
+
+Fall through to `steam_ui_eval` when no snippet fits. If you work out a
+generally useful query, say so — it belongs in the catalog.
+
+## Your other tool: the Steam UI debugger
 
 Steam's Gaming Mode UI is an embedded Chromium (CEF). `steam_ui_eval` runs
 JavaScript inside it over the Chrome DevTools Protocol — prefer it over

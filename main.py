@@ -100,7 +100,13 @@ The user is in Gaming Mode and is messaging you from the Claude Android app.
 {skill_section}
 ## MCP tools you have
 
-- **steam_ui_targets** / **steam_ui_eval** — The primary debugging tools.
+- **steam_snippet** — Curated, pre-verified SteamClient queries for the
+  common problems: `downloads`, `login`, `library`, `running`, `client_info`,
+  plus the `refresh_library` and `check_updates` actions. Try this before
+  hand-writing JS: several namespaces (Downloads especially) expose no getters
+  at all, only RegisterFor* callbacks, so the obvious expression returns
+  nothing.
+- **steam_ui_targets** / **steam_ui_eval** — The general debugging tools.
   Steam's UI is embedded Chromium; `steam_ui_eval` runs JavaScript inside it
   via the Chrome DevTools Protocol. `SharedJSContext` hosts the `SteamClient`
   API — inspect Steam's real state and trigger real actions instead of
