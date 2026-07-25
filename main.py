@@ -12,6 +12,9 @@ logger = logging.getLogger("decky-claude")
 
 _ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _URL_PATTERN = re.compile(r"https://claude\.ai/code/session_[A-Za-z0-9_-]+")
+# `claude auth login` prints its OAuth URL wrapped in an OSC-8 hyperlink, so
+# stop at ESC/BEL/] rather than whitespace.
+_OAUTH_URL = re.compile(r"https://[^\s\x1b\x07\]]*/oauth/[^\s\x1b\x07\]]+")
 
 # Sentinel used to mark the block we inject into CLAUDE.md
 _MD_START = "<!-- decky-claude-start -->"
@@ -138,6 +141,11 @@ class Plugin:
     _skill_name: str | None = None
     _skill_link_created: str | None = None
 
+    # ── login flow state ───────────────────────────────────────────────────────
+    _login_proc: asyncio.subprocess.Process | None = None
+    _login_fd: int | None = None
+    _login_url: str | None = None
+
     # ── screen state ───────────────────────────────────────────────────────────
     _last_thumb_b64: str | None = None
 
@@ -148,6 +156,7 @@ class Plugin:
         self._log_lines = []
 
     async def _unload(self):
+        await self.cancel_login()
         await self.stop_session()
 
     # ── session API ────────────────────────────────────────────────────────────
@@ -261,6 +270,232 @@ class Plugin:
 
     async def get_log(self):
         return {"lines": self._log_lines[-30:]}
+
+    # ── authentication ─────────────────────────────────────────────────────────
+
+    async def get_auth(self):
+        """Login state straight from the CLI, so it can't drift from reality."""
+        claude_bin = await self._find_claude()
+        if not claude_bin:
+            return {"logged_in": False, "error": "claude not found"}
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                claude_bin, "auth", "status", "--json",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                env={**os.environ, **self._display_env()},
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+            data = json.loads(out.decode(errors="replace"))
+        except (OSError, asyncio.TimeoutError, json.JSONDecodeError) as exc:
+            return {"logged_in": False, "error": str(exc)}
+        return {
+            "logged_in": bool(data.get("loggedIn")),
+            "email": data.get("email"),
+            "org": data.get("orgName"),
+            "plan": data.get("subscriptionType"),
+            "method": data.get("authMethod"),
+        }
+
+    async def start_login(self):
+        """Begin `claude auth login` and hand back the OAuth URL to show as a QR.
+
+        The CLI renders the URL as an OSC-8 hyperlink and then blocks on a
+        "Paste code here" prompt, so it needs a pty and the process has to stay
+        alive until submit_login_code() feeds the code back.
+        """
+        if self._login_fd is not None:
+            if self._login_url:
+                return {"success": True, "url": self._login_url}
+            await self.cancel_login()
+
+        claude_bin = await self._find_claude()
+        if not claude_bin:
+            return {"success": False, "error": "claude not found"}
+
+        master_fd, slave_fd = pty.openpty()
+        try:
+            self._login_proc = await asyncio.create_subprocess_exec(
+                claude_bin, "auth", "login",
+                cwd=_USER_HOME,
+                env={**os.environ, **self._display_env()},
+                stdout=slave_fd,
+                stderr=slave_fd,
+                stdin=slave_fd,
+            )
+        except Exception as exc:
+            os.close(slave_fd)
+            os.close(master_fd)
+            return {"success": False, "error": str(exc)}
+        os.close(slave_fd)
+        self._login_fd = master_fd
+        self._login_url = None
+
+        loop = asyncio.get_event_loop()
+        buf = b""
+        deadline = loop.time() + 30
+        while loop.time() < deadline:
+            try:
+                chunk = await asyncio.wait_for(
+                    loop.run_in_executor(None, os.read, master_fd, 4096), timeout=5
+                )
+            except (asyncio.TimeoutError, OSError):
+                break
+            if not chunk:
+                break
+            buf += chunk
+            match = _OAUTH_URL.search(buf.decode("utf-8", errors="replace"))
+            if match:
+                self._login_url = match.group(0)
+                return {"success": True, "url": self._login_url}
+
+        await self.cancel_login()
+        return {"success": False, "error": "Timed out waiting for the login URL"}
+
+    async def submit_login_code(self, code: str):
+        """Feed the pasted OAuth code back to the waiting login process."""
+        if self._login_fd is None:
+            return {"success": False, "error": "No login in progress"}
+        try:
+            os.write(self._login_fd, (code.strip() + "\n").encode())
+        except OSError as exc:
+            return {"success": False, "error": str(exc)}
+
+        try:
+            await asyncio.wait_for(self._login_proc.wait(), timeout=60)
+        except (asyncio.TimeoutError, AttributeError):
+            pass
+        await self.cancel_login()
+
+        auth = await self.get_auth()
+        if auth.get("logged_in"):
+            return {"success": True, **auth}
+        return {"success": False, "error": auth.get("error") or "Login did not complete"}
+
+    async def cancel_login(self):
+        if self._login_proc and self._login_proc.returncode is None:
+            try:
+                self._login_proc.kill()
+            except ProcessLookupError:
+                pass
+        self._login_proc = None
+        if self._login_fd is not None:
+            try:
+                os.close(self._login_fd)
+            except OSError:
+                pass
+            self._login_fd = None
+        self._login_url = None
+        return {"success": True}
+
+    # ── other sessions on this machine ─────────────────────────────────────────
+
+    async def list_sessions(self, limit: int = 8):
+        """Recent Claude Code sessions belonging to this user.
+
+        Transcripts live in ~/.claude/projects/<encoded-cwd>/<session>.jsonl.
+        The encoded directory name is lossy (slashes and dashes collapse), so
+        read the real cwd out of the transcript instead.
+        """
+        root = os.path.join(_USER_HOME, ".claude", "projects")
+        live = self._live_session_cwds()
+        entries = []
+        try:
+            for project in os.listdir(root):
+                pdir = os.path.join(root, project)
+                if not os.path.isdir(pdir):
+                    continue
+                for name in os.listdir(pdir):
+                    if not name.endswith(".jsonl"):
+                        continue
+                    path = os.path.join(pdir, name)
+                    try:
+                        mtime = os.path.getmtime(path)
+                    except OSError:
+                        continue
+                    entries.append((mtime, path, name[: -len(".jsonl")]))
+        except OSError as exc:
+            return {"sessions": [], "error": str(exc)}
+
+        entries.sort(reverse=True)
+        sessions = []
+        for mtime, path, session_id in entries[:limit]:
+            cwd = self._session_cwd(path) or self._decode_project_dir(
+                os.path.basename(os.path.dirname(path))
+            )
+            sessions.append({
+                "id": session_id,
+                "short_id": session_id[:8],
+                "cwd": cwd,
+                "label": os.path.basename(cwd.rstrip("/")) or cwd,
+                "mtime": int(mtime),
+                "live": cwd in live,
+                "current": os.path.realpath(cwd) == os.path.realpath(self._working_dir)
+                and self._status == "running",
+            })
+        return {"sessions": sessions}
+
+    @staticmethod
+    def _decode_project_dir(name: str) -> str:
+        """Best-effort cwd from the encoded project directory name.
+
+        Claude encodes the cwd by replacing "/" with "-", which is lossy for
+        paths that already contain dashes. Only used when the transcript itself
+        carries no cwd, so an approximate path beats showing nothing.
+        """
+        candidate = "/" + name.lstrip("-").replace("-", "/")
+        if os.path.isdir(candidate):
+            return candidate
+        return candidate.rstrip("/") or "/"
+
+    @staticmethod
+    def _session_cwd(path: str) -> str | None:
+        """cwd from the first transcript lines that carry it (usually line ~3)."""
+        try:
+            with open(path, "r", errors="replace") as f:
+                for _ in range(12):
+                    line = f.readline()
+                    if not line:
+                        break
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(record, dict) and record.get("cwd"):
+                        return record["cwd"]
+        except OSError:
+            pass
+        return None
+
+    @staticmethod
+    def _live_session_cwds() -> set:
+        """cwds of running claude processes owned by this user.
+
+        Other users' processes are deliberately skipped: /proc/<pid>/cwd is not
+        readable across uids, so they could only ever be reported as unknown.
+        """
+        uid = os.getuid()
+        cwds = set()
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            base = f"/proc/{pid}"
+            try:
+                if os.stat(base).st_uid != uid:
+                    continue
+                with open(f"{base}/cmdline", "rb") as f:
+                    argv = f.read().split(b"\0")
+            except OSError:
+                continue
+            # Exact match: this plugin's own backend is titled "decky-claude",
+            # which would otherwise match a substring test against its own cwd.
+            if not argv or os.path.basename(argv[0] or b"") != b"claude":
+                continue
+            try:
+                cwds.add(os.readlink(f"{base}/cwd"))
+            except OSError:
+                continue
+        return cwds
 
     async def list_dirs(self):
         base = _USER_HOME

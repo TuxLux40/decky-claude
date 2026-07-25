@@ -4,11 +4,13 @@ import {
   PanelSection,
   PanelSectionRow,
   staticClasses,
+  TextField,
   ToggleField,
 } from "@decky/ui";
 import { callable, definePlugin } from "@decky/api";
 import { useEffect, useState } from "react";
 import { FaTerminal } from "react-icons/fa";
+import qrcode from "qrcode-generator";
 
 // ── backend callables ──────────────────────────────────────────────────────────
 
@@ -33,9 +35,35 @@ const sendKey = callable<[string], { success: boolean; error?: string }>("send_k
 const sendText = callable<[string], { success: boolean; error?: string }>("send_text");
 const sendMouseClick = callable<[number], { success: boolean; error?: string }>("send_mouse_click");
 
+const getAuth = callable<
+  [],
+  { logged_in: boolean; email?: string; org?: string; plan?: string; error?: string }
+>("get_auth");
+const startLogin = callable<[], { success: boolean; url?: string; error?: string }>("start_login");
+const submitLoginCode = callable<
+  [string],
+  { success: boolean; email?: string; error?: string }
+>("submit_login_code");
+const cancelLogin = callable<[], { success: boolean }>("cancel_login");
+
+const listSessions = callable<
+  [],
+  { sessions: MachineSession[]; error?: string }
+>("list_sessions");
+
 // ── types ──────────────────────────────────────────────────────────────────────
 
 type SessionStatus = "stopped" | "starting" | "running" | "error";
+
+interface MachineSession {
+  id: string;
+  short_id: string;
+  cwd: string;
+  label: string;
+  mtime: number;
+  live: boolean;
+  current: boolean;
+}
 
 const STATUS_COLOR: Record<SessionStatus, string> = {
   stopped: "#888",
@@ -51,18 +79,67 @@ const QUICK_KEYS = [
   { label: "Tab", key: "Tab" },
 ];
 
+function relativeTime(epochSeconds: number): string {
+  const mins = Math.max(0, Math.floor(Date.now() / 1000 - epochSeconds) / 60);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${Math.floor(mins)}m ago`;
+  if (mins < 60 * 24) return `${Math.floor(mins / 60)}h ago`;
+  return `${Math.floor(mins / 60 / 24)}d ago`;
+}
+
+/** QR as a single scaled bitmap.
+ *
+ *  An OAuth URL is ~450 chars, which needs a 73x73 matrix — rendering that as
+ *  a div grid would be 5000+ DOM nodes for CEF to lay out. createDataURL emits
+ *  one GIF instead; upscaling it with pixelated rendering keeps the module
+ *  edges hard, which is what the phone camera needs.
+ */
+function QrCode({ text, size = 260 }: { text: string; size?: number }) {
+  // Type 0 auto-picks the smallest version that fits; "L" adds the least
+  // redundancy, so the matrix stays as small (and each module as large) as
+  // possible for a long URL.
+  const qr = qrcode(0, "L");
+  qr.addData(text);
+  qr.make();
+  const src = qr.createDataURL(8, 1);
+
+  return (
+    <div style={{ background: "#fff", padding: 10, borderRadius: 6, margin: "0 auto" }}>
+      <img
+        src={src}
+        width={size}
+        height={size}
+        style={{ display: "block", imageRendering: "pixelated" }}
+        alt="Sign-in QR code"
+      />
+    </div>
+  );
+}
+
 // ── component ──────────────────────────────────────────────────────────────────
 
 function Content() {
   // session
   const [status, setStatus] = useState<SessionStatus>("stopped");
   const [sessionUrl, setSessionUrl] = useState<string | null>(null);
-  const [workingDir, setWorkingDir] = useState("/home/deck");
-  const [dirs, setDirs] = useState<string[]>(["/home/deck"]);
+  const [workingDir, setWorkingDir] = useState("");
+  const [dirs, setDirs] = useState<string[]>([]);
   const [sessionLoading, setSessionLoading] = useState(false);
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [urlCopied, setUrlCopied] = useState(false);
   const [skill, setSkill] = useState<string | null>(null);
+
+  // auth
+  const [loggedIn, setLoggedIn] = useState<boolean | null>(null);
+  const [account, setAccount] = useState<string | null>(null);
+  const [plan, setPlan] = useState<string | null>(null);
+  const [loginUrl, setLoginUrl] = useState<string | null>(null);
+  const [loginBusy, setLoginBusy] = useState(false);
+  const [loginCode, setLoginCode] = useState("");
+  const [loginError, setLoginError] = useState<string | null>(null);
+
+  // other sessions on this machine
+  const [machineSessions, setMachineSessions] = useState<MachineSession[]>([]);
 
   // screen
   const [thumbnail, setThumbnail] = useState<string | null>(null);
@@ -75,8 +152,15 @@ function Content() {
 
   // ── init ──
   useEffect(() => {
-    listDirs().then((r) => setDirs(r.dirs));
+    listDirs().then((r) => {
+      setDirs(r.dirs);
+      // The backend resolves the real home; adopt its first entry as default
+      // rather than assuming /home/deck on the frontend.
+      setWorkingDir((cur) => cur || r.dirs[0] || "");
+    });
     syncStatus();
+    syncAuth();
+    syncMachineSessions();
     getScreenState().then((r) => { if (r.thumbnail) setThumbnail(r.thumbnail); });
   }, []);
 
@@ -84,6 +168,58 @@ function Content() {
     const id = setInterval(syncStatus, 3000);
     return () => clearInterval(id);
   }, []);
+
+  useEffect(() => {
+    const id = setInterval(syncMachineSessions, 10000);
+    return () => clearInterval(id);
+  }, []);
+
+  async function syncAuth() {
+    const r = await getAuth();
+    setLoggedIn(r.logged_in);
+    setAccount(r.email ?? null);
+    setPlan(r.plan ?? null);
+    if (r.logged_in) {
+      setLoginUrl(null);
+      setLoginError(null);
+    }
+  }
+
+  async function syncMachineSessions() {
+    const r = await listSessions();
+    setMachineSessions(r.sessions ?? []);
+  }
+
+  async function handleStartLogin() {
+    setLoginBusy(true);
+    setLoginError(null);
+    const r = await startLogin();
+    setLoginBusy(false);
+    if (r.success && r.url) setLoginUrl(r.url);
+    else setLoginError(r.error ?? "Could not start login");
+  }
+
+  async function handleSubmitCode() {
+    if (!loginCode.trim()) return;
+    setLoginBusy(true);
+    setLoginError(null);
+    const r = await submitLoginCode(loginCode);
+    setLoginBusy(false);
+    setLoginCode("");
+    if (r.success) {
+      setLoginUrl(null);
+      await syncAuth();
+    } else {
+      setLoginError(r.error ?? "Login failed");
+    }
+  }
+
+  async function handleCancelLogin() {
+    await cancelLogin();
+    setLoginUrl(null);
+    setLoginCode("");
+    setLoginError(null);
+  }
 
   async function syncStatus() {
     const r = await getStatus();
@@ -181,6 +317,68 @@ function Content() {
 
   return (
     <>
+      {/* ── Sign in ────────────────────────────────────────────────────── */}
+      {loggedIn === false && (
+        <PanelSection title="Sign in to Claude Code">
+          {!loginUrl && (
+            <>
+              <PanelSectionRow>
+                <div style={{ fontSize: 11, color: "#f0a500", lineHeight: 1.4 }}>
+                  Not signed in — a session can't start until you do.
+                </div>
+              </PanelSectionRow>
+              <PanelSectionRow>
+                <ButtonItem layout="below" disabled={loginBusy} onClick={handleStartLogin}>
+                  {loginBusy ? "Starting…" : "Sign in"}
+                </ButtonItem>
+              </PanelSectionRow>
+            </>
+          )}
+
+          {loginUrl && (
+            <>
+              <PanelSectionRow>
+                <div style={{ fontSize: 11, color: "#aaa", lineHeight: 1.4 }}>
+                  Scan with your phone, approve the login, then paste the code below.
+                </div>
+              </PanelSectionRow>
+              <PanelSectionRow>
+                <QrCode text={loginUrl} />
+              </PanelSectionRow>
+              <PanelSectionRow>
+                <TextField
+                  label="Code from browser"
+                  value={loginCode}
+                  onChange={(e) => setLoginCode(e.target.value)}
+                />
+              </PanelSectionRow>
+              <PanelSectionRow>
+                <ButtonItem
+                  layout="below"
+                  disabled={loginBusy || !loginCode.trim()}
+                  onClick={handleSubmitCode}
+                >
+                  {loginBusy ? "Signing in…" : "Submit code"}
+                </ButtonItem>
+              </PanelSectionRow>
+              <PanelSectionRow>
+                <ButtonItem layout="below" onClick={handleCancelLogin}>
+                  Cancel
+                </ButtonItem>
+              </PanelSectionRow>
+            </>
+          )}
+
+          {loginError && (
+            <PanelSectionRow>
+              <div style={{ fontSize: 11, color: "#f44336", wordBreak: "break-word" }}>
+                {loginError}
+              </div>
+            </PanelSectionRow>
+          )}
+        </PanelSection>
+      )}
+
       {/* ── Remote Session ─────────────────────────────────────────────── */}
       <PanelSection title="Claude Code Remote">
         <PanelSectionRow>
@@ -195,6 +393,14 @@ function Content() {
             <span style={{ color: statusColor, fontWeight: 600 }}>{statusLabel}</span>
           </div>
         </PanelSectionRow>
+
+        {loggedIn && account && (
+          <PanelSectionRow>
+            <div style={{ fontSize: 11, color: "#888" }}>
+              {account}{plan ? ` · ${plan}` : ""}
+            </div>
+          </PanelSectionRow>
+        )}
 
         {isRunning && (
           <PanelSectionRow>
@@ -286,6 +492,46 @@ function Content() {
           </PanelSectionRow>
         )}
       </PanelSection>
+
+      {/* ── Sessions on this machine ───────────────────────────────────── */}
+      {machineSessions.length > 0 && (
+        <PanelSection title="Sessions on this device">
+          {machineSessions.map((s) => (
+            <PanelSectionRow key={s.id}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, width: "100%" }}>
+                <div
+                  style={{
+                    width: 8, height: 8, borderRadius: "50%", flexShrink: 0,
+                    background: s.live ? "#4caf50" : "#555",
+                    boxShadow: s.live ? "0 0 6px #4caf50" : "none",
+                  }}
+                />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{
+                    fontSize: 12, fontWeight: s.current ? 700 : 500,
+                    color: s.current ? "#5ba3f5" : "#ddd",
+                    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                  }}>
+                    {s.label}{s.current ? " (this panel)" : ""}
+                  </div>
+                  <div style={{
+                    fontSize: 10, color: "#777",
+                    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                  }}>
+                    {s.live ? "running" : relativeTime(s.mtime)} · {s.short_id}
+                  </div>
+                </div>
+              </div>
+            </PanelSectionRow>
+          ))}
+          <PanelSectionRow>
+            <div style={{ fontSize: 10, color: "#666", lineHeight: 1.4 }}>
+              Green means a claude process is live in that directory. Open it from
+              the Claude app — remote control is always on for new sessions.
+            </div>
+          </PanelSectionRow>
+        </PanelSection>
+      )}
 
       {/* ── Screen Preview ──────────────────────────────────────────────── */}
       <PanelSection title="Screen Preview">
