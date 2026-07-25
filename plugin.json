@@ -2,5 +2,6 @@
   "name": "decky-claude",
   "version": "1.0.0",
   "author": "TuxLux40",
-  "flags": []
+  "flags": [],
+  "api_version": 1
 }
