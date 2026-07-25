@@ -10,7 +10,7 @@ import {
   ToggleField,
 } from "@decky/ui";
 import { callable, definePlugin } from "@decky/api";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { FaTerminal } from "react-icons/fa";
 import qrcode from "qrcode-generator";
 
@@ -62,7 +62,9 @@ const listSessions = callable<
 
 // ── types ──────────────────────────────────────────────────────────────────────
 
-type SessionStatus = "stopped" | "starting" | "running" | "error";
+const SESSION_STATUSES = ["stopped", "starting", "running", "error"] as const;
+
+type SessionStatus = (typeof SESSION_STATUSES)[number];
 
 interface MachineSession {
   id: string;
@@ -89,6 +91,25 @@ const QUICK_KEYS = [
   { label: "Tab", key: "Tab" },
 ];
 
+/** The status crosses the RPC boundary as a bare string, so a backend that
+ *  gains a state the UI doesn't know about must not slip past the union. */
+function parseStatus(value: unknown): SessionStatus | null {
+  return SESSION_STATUSES.includes(value as SessionStatus) ? (value as SessionStatus) : null;
+}
+
+/** Callables reject on transport/serialisation failures as well as returning
+ *  {success: false}, and both paths have to end up in the same banner. */
+function errorText(e: unknown, fallback: string): string {
+  const msg = e instanceof Error ? e.message : typeof e === "string" ? e : "";
+  return msg.trim() || fallback;
+}
+
+/** Polls run every few seconds, so a transient failure must not tear the panel
+ *  down or bury the banner a user-initiated action just wrote. */
+function logPollFailure(e: unknown) {
+  console.error("[decky-claude] background sync failed:", e);
+}
+
 function relativeTime(epochSeconds: number): string {
   const mins = Math.max(0, Math.floor(Date.now() / 1000 - epochSeconds) / 60);
   if (mins < 1) return "just now";
@@ -105,13 +126,17 @@ function relativeTime(epochSeconds: number): string {
  *  edges hard, which is what the phone camera needs.
  */
 function QrCode({ text, size = 260 }: { text: string; size?: number }) {
-  // Type 0 auto-picks the smallest version that fits; "L" adds the least
-  // redundancy, so the matrix stays as small (and each module as large) as
-  // possible for a long URL.
-  const qr = qrcode(0, "L");
-  qr.addData(text);
-  qr.make();
-  const src = qr.createDataURL(8, 1);
+  // Encoding is expensive enough to be felt on a keystroke in the sibling
+  // login-code field, and the bitmap only depends on the URL.
+  const src = useMemo(() => {
+    // Type 0 auto-picks the smallest version that fits; "L" adds the least
+    // redundancy, so the matrix stays as small (and each module as large) as
+    // possible for a long URL.
+    const qr = qrcode(0, "L");
+    qr.addData(text);
+    qr.make();
+    return qr.createDataURL(8, 1);
+  }, [text]);
 
   return (
     <div style={{ background: "#fff", padding: 10, borderRadius: 6, margin: "0 auto" }}>
@@ -164,16 +189,20 @@ function Content() {
 
   // ── init ──
   useEffect(() => {
-    listDirs().then((r) => {
-      setDirs(r.dirs);
-      // The backend resolves the real home; adopt its first entry as default
-      // rather than assuming /home/deck on the frontend.
-      setWorkingDir((cur) => cur || r.dirs[0] || "");
-    });
+    listDirs()
+      .then((r) => {
+        setDirs(r.dirs);
+        // The backend resolves the real home; adopt its first entry as default
+        // rather than assuming /home/deck on the frontend.
+        setWorkingDir((cur) => cur || r.dirs[0] || "");
+      })
+      .catch((e) => setSessionError(errorText(e, "Could not list working directories")));
     syncStatus();
     syncAuth();
     syncMachineSessions();
-    getScreenState().then((r) => { if (r.thumbnail) setThumbnail(r.thumbnail); });
+    getScreenState()
+      .then((r) => { if (r.thumbnail) setThumbnail(r.thumbnail); })
+      .catch(logPollFailure);
   }, []);
 
   useEffect(() => {
@@ -187,61 +216,98 @@ function Content() {
   }, []);
 
   async function syncAuth() {
-    const r = await getAuth();
-    setLoggedIn(r.logged_in);
-    setAccount(r.email ?? null);
-    setPlan(r.plan ?? null);
-    if (r.logged_in) {
-      setLoginUrl(null);
-      setLoginError(null);
+    try {
+      const r = await getAuth();
+      setLoggedIn(r.logged_in);
+      setAccount(r.email ?? null);
+      setPlan(r.plan ?? null);
+      if (r.logged_in) {
+        setLoginUrl(null);
+        setLoginError(null);
+      }
+    } catch (e) {
+      logPollFailure(e);
     }
   }
 
   async function syncMachineSessions() {
-    const r = await listSessions();
-    setMachineSessions(r.sessions ?? []);
+    try {
+      const r = await listSessions();
+      setMachineSessions(r.sessions ?? []);
+    } catch (e) {
+      logPollFailure(e);
+    }
   }
 
   async function handleStartLogin() {
     setLoginBusy(true);
     setLoginError(null);
-    const r = await startLogin();
-    setLoginBusy(false);
-    if (r.success && r.url) setLoginUrl(r.url);
-    else setLoginError(r.error ?? "Could not start login");
+    try {
+      const r = await startLogin();
+      if (r.success && r.url) setLoginUrl(r.url);
+      else setLoginError(r.error ?? "Could not start login");
+    } catch (e) {
+      setLoginError(errorText(e, "Could not start login"));
+    } finally {
+      setLoginBusy(false);
+    }
   }
 
   async function handleSubmitCode() {
     if (!loginCode.trim()) return;
     setLoginBusy(true);
     setLoginError(null);
-    const r = await submitLoginCode(loginCode);
-    setLoginBusy(false);
-    setLoginCode("");
-    if (r.success) {
-      setLoginUrl(null);
-      await syncAuth();
-    } else {
-      setLoginError(r.error ?? "Login failed");
+    try {
+      const r = await submitLoginCode(loginCode);
+      setLoginCode("");
+      if (r.success) {
+        setLoginUrl(null);
+        await syncAuth();
+      } else {
+        setLoginError(r.error ?? "Login failed");
+      }
+    } catch (e) {
+      // The code is single-use once the backend has seen it, so clear it here
+      // too and let the user paste a fresh one.
+      setLoginCode("");
+      setLoginError(errorText(e, "Login failed"));
+    } finally {
+      setLoginBusy(false);
     }
   }
 
   async function handleCancelLogin() {
-    await cancelLogin();
+    try {
+      await cancelLogin();
+    } catch (e) {
+      logPollFailure(e);
+    }
+    // Cancelling is a UI retreat: drop the login state either way, otherwise a
+    // failed cancel strands the user on a QR code they can no longer use.
     setLoginUrl(null);
     setLoginCode("");
     setLoginError(null);
   }
 
   async function syncStatus() {
-    const r = await getStatus();
-    setStatus(r.status as SessionStatus);
-    setSessionUrl(r.url ?? null);
-    setSkill(r.skill ?? null);
-    // A session started before the panel was opened still has to show what it
-    // is resuming, so the backend's value wins while one is running.
-    if (r.status === "running" || r.status === "starting") setResumeId(r.resume_id ?? "");
-    if (r.error) setSessionError(r.error);
+    try {
+      const r = await getStatus();
+      const next = parseStatus(r.status);
+      if (next) {
+        setStatus(next);
+      } else {
+        setStatus("error");
+        setSessionError(`Backend reported an unknown status: ${String(r.status)}`);
+      }
+      setSessionUrl(r.url ?? null);
+      setSkill(r.skill ?? null);
+      // A session started before the panel was opened still has to show what it
+      // is resuming, so the backend's value wins while one is running.
+      if (next === "running" || next === "starting") setResumeId(r.resume_id ?? "");
+      if (r.error) setSessionError(r.error);
+    } catch (e) {
+      logPollFailure(e);
+    }
   }
 
   // ── session ──
@@ -257,6 +323,9 @@ function Content() {
         setStatus("error");
         setSessionError(r.error ?? "Failed to start session");
       }
+    } catch (e) {
+      setStatus("error");
+      setSessionError(errorText(e, "Failed to start session"));
     } finally {
       setSessionLoading(false);
     }
@@ -270,6 +339,10 @@ function Content() {
       setSessionUrl(null);
       setSessionError(null);
       setResumeId("");
+    } catch (e) {
+      // The process may well still be alive, so leave the status alone and let
+      // the poll report what actually happened.
+      setSessionError(errorText(e, "Failed to stop session"));
     } finally {
       setSessionLoading(false);
     }
@@ -298,6 +371,8 @@ function Content() {
       } else if (!r.success) {
         setCaptureError(r.error ?? "Capture failed");
       }
+    } catch (e) {
+      setCaptureError(errorText(e, "Capture failed"));
     } finally {
       setCaptureLoading(false);
     }
@@ -310,20 +385,32 @@ function Content() {
   }
 
   async function handleKey(key: string) {
-    const r = await sendKey(key);
-    showFeedback(r.success ? `Sent: ${key}` : (r.error ?? "Failed"), r.success);
+    try {
+      const r = await sendKey(key);
+      showFeedback(r.success ? `Sent: ${key}` : (r.error ?? "Failed"), r.success);
+    } catch (e) {
+      showFeedback(errorText(e, "Failed"), false);
+    }
   }
 
   async function handleType() {
     if (!typeText) return;
-    const r = await sendText(typeText);
-    showFeedback(r.success ? "Typed!" : (r.error ?? "Failed"), r.success);
-    if (r.success) setTypeText("");
+    try {
+      const r = await sendText(typeText);
+      showFeedback(r.success ? "Typed!" : (r.error ?? "Failed"), r.success);
+      if (r.success) setTypeText("");
+    } catch (e) {
+      showFeedback(errorText(e, "Failed"), false);
+    }
   }
 
   async function handleClick(button: number) {
-    const r = await sendMouseClick(button);
-    showFeedback(r.success ? "Clicked" : (r.error ?? "Failed"), r.success);
+    try {
+      const r = await sendMouseClick(button);
+      showFeedback(r.success ? "Clicked" : (r.error ?? "Failed"), r.success);
+    } catch (e) {
+      showFeedback(errorText(e, "Failed"), false);
+    }
   }
 
   const isRunning = status === "running" || status === "starting";

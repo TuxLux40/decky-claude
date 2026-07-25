@@ -4,3 +4,7 @@ out/
 *.zip
 .pnpm-store/
 __pycache__/
+
+# Injected into a working directory by the plugin itself
+.mcp.json
+.claude/

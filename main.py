@@ -7,7 +7,18 @@ import os
 import pty
 import pwd
 import re
+import sys
 import uuid
+from collections import OrderedDict
+
+# Decky imports this file by path, so the plugin directory is not guaranteed to
+# be on sys.path — anchor it so the sibling module shared with mcp_server.py
+# resolves either way.
+_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+if _PLUGIN_DIR not in sys.path:
+    sys.path.insert(0, _PLUGIN_DIR)
+
+import deck_common  # noqa: E402  (needs the sys.path anchor above)
 
 logger = logging.getLogger("decky-claude")
 
@@ -65,7 +76,7 @@ _USER_HOME, _USER_UID = _resolve_user()
 # ~/.claude/skills overrides the one bundled with the plugin.
 _SKILL_BASES = [
     os.path.join(_USER_HOME, ".claude", "skills"),
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills"),
+    os.path.join(_PLUGIN_DIR, "skills"),
 ]
 
 
@@ -115,19 +126,6 @@ The user is in Gaming Mode and is messaging you from the Claude Android app.
    screenshot or `steam_ui_eval` read.
 {_MD_END}
 """
-
-_KEY_MAP: dict[str, str] = {
-    "escape": "KEY_ESC",
-    "Return": "KEY_ENTER",
-    "space": "KEY_SPACE",
-    "Tab": "KEY_TAB",
-    "F1": "KEY_F1",
-    "F2": "KEY_F2",
-    "F3": "KEY_F3",
-    "F4": "KEY_F4",
-    "F5": "KEY_F5",
-    "F12": "KEY_F12",
-}
 
 
 class Plugin:
@@ -192,7 +190,16 @@ class Plugin:
             )
             return {"success": False, "error": self._error_msg}
 
-        mcp_config = self._setup_working_dir(working_dir)
+        try:
+            mcp_config = self._setup_working_dir(working_dir)
+        except OSError as exc:
+            logger.error("could not prepare %s: %s", working_dir, exc)
+            self._status = "error"
+            self._error_msg = (
+                f"Could not prepare {working_dir}: {exc}. "
+                "Pick a directory you can write to."
+            )
+            return {"success": False, "error": self._error_msg}
         self._trust_working_dir(working_dir)
 
         # claude falls back to non-interactive "-p" behaviour (which then
@@ -463,7 +470,11 @@ class Plugin:
             })
         return {"sessions": sessions}
 
-    _preview_cache: dict = {}
+    # Keyed by transcript path, so it would otherwise grow with every session
+    # this machine has ever recorded. The panel only ever renders one page of
+    # list_sessions, so a few pages' worth of history is ample.
+    _PREVIEW_CACHE_MAX = 64
+    _preview_cache: "OrderedDict[str, tuple[float, str]]" = OrderedDict()
 
     @classmethod
     def _session_preview(cls, path: str, mtime: float) -> str:
@@ -473,6 +484,7 @@ class Plugin:
         """
         cached = cls._preview_cache.get(path)
         if cached and cached[0] == mtime:
+            cls._preview_cache.move_to_end(path)
             return cached[1]
 
         preview = ""
@@ -510,6 +522,9 @@ class Plugin:
             pass
 
         cls._preview_cache[path] = (mtime, preview)
+        cls._preview_cache.move_to_end(path)
+        while len(cls._preview_cache) > cls._PREVIEW_CACHE_MAX:
+            cls._preview_cache.popitem(last=False)
         return preview
 
     def _session_dir(self, session_id: str) -> str | None:
@@ -619,29 +634,13 @@ class Plugin:
     # ── input API (manual controls in the panel) ───────────────────────────────
 
     async def send_key(self, key: str):
-        env = self._display_env()
-        r = await self._run_cmd(["xdotool", "key", "--clearmodifiers", key], env)
-        if r["success"]:
-            return r
-        ydokey = _KEY_MAP.get(key, f"KEY_{key.upper()}")
-        return await self._run_cmd(["ydotool", "key", ydokey], env)
+        return await self._run_first(deck_common.key_commands(key))
 
     async def send_text(self, text: str):
-        env = self._display_env()
-        r = await self._run_cmd(
-            ["xdotool", "type", "--clearmodifiers", "--delay", "20", "--", text], env
-        )
-        if r["success"]:
-            return r
-        return await self._run_cmd(["ydotool", "type", "--", text], env)
+        return await self._run_first(deck_common.type_commands(text))
 
     async def send_mouse_click(self, button: int = 1):
-        env = self._display_env()
-        r = await self._run_cmd(["xdotool", "click", str(button)], env)
-        if r["success"]:
-            return r
-        btn_code = {1: "0xC0", 3: "0xC1", 2: "0xC2"}.get(button, "0xC0")
-        return await self._run_cmd(["ydotool", "click", btn_code], env)
+        return await self._run_first(deck_common.click_commands(button))
 
     # ── working-dir setup / teardown ───────────────────────────────────────────
 
@@ -666,7 +665,12 @@ class Plugin:
         try:
             with open(config_path) as f:
                 config = json.load(f)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
+            # Not fatal on its own, but it is the likeliest reason a session
+            # starts and then sits there printing nothing, so say so loudly.
+            logger.error(
+                "cannot pre-approve trust/MCP prompts, %s unreadable: %s", config_path, exc
+            )
             return
 
         projects = config.setdefault("projects", {})
@@ -686,7 +690,8 @@ class Plugin:
             with open(tmp_path, "w") as f:
                 json.dump(config, f, indent=2)
             os.replace(tmp_path, config_path)
-        except OSError:
+        except OSError as exc:
+            logger.error("could not write %s: %s", config_path, exc)
             try:
                 os.remove(tmp_path)
             except OSError:
@@ -694,47 +699,66 @@ class Plugin:
 
     def _setup_working_dir(self, working_dir: str) -> str:
         """Write .mcp.json, link the steam-debugger skill, inject our CLAUDE.md
-        block. Returns the path of the MCP config to pass via --mcp-config."""
+        block. Returns the path of the MCP config to pass via --mcp-config.
+
+        Raises OSError if the working directory cannot be prepared. Every write
+        here is load-bearing — without them the session comes up with no tools
+        and no idea it is on a Steam Deck — so the caller aborts the launch
+        rather than starting a session that silently cannot do its job.
+        """
         claude_dir = os.path.join(working_dir, ".claude")
-        os.makedirs(claude_dir, exist_ok=True)
+        try:
+            os.makedirs(claude_dir, exist_ok=True)
+        except OSError as exc:
+            logger.error("cannot create %s: %s", claude_dir, exc)
+            raise
 
         # MCP server config — points to mcp_server.py next to this file.
         # Written to .mcp.json (project scope) and also passed explicitly via
         # --mcp-config so no trust prompt can block the headless session.
-        plugin_dir = os.path.dirname(os.path.abspath(__file__))
-        mcp_server = os.path.join(plugin_dir, "mcp_server.py")
+        mcp_server = os.path.join(_PLUGIN_DIR, "mcp_server.py")
         mcp_config_path = os.path.join(working_dir, ".mcp.json")
 
         existing_mcp: dict = {}
         if os.path.exists(mcp_config_path):
+            # A malformed or unreadable file is not fatal: our own entry is
+            # what matters and it gets rewritten from scratch below.
             try:
                 with open(mcp_config_path) as f:
                     existing_mcp = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                pass
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning("ignoring unreadable %s: %s", mcp_config_path, exc)
 
         servers = existing_mcp.setdefault("mcpServers", {})
         servers["steamdeck"] = {
             "command": "python3",
             "args": [mcp_server],
         }
-        with open(mcp_config_path, "w") as f:
-            json.dump(existing_mcp, f, indent=2)
+        try:
+            with open(mcp_config_path, "w") as f:
+                json.dump(existing_mcp, f, indent=2)
+        except OSError as exc:
+            logger.error("cannot write %s: %s", mcp_config_path, exc)
+            raise
 
         self._setup_skill(working_dir)
 
         # CLAUDE.md — append our block (idempotent)
         md_path = os.path.join(working_dir, "CLAUDE.md")
         existing_md = ""
-        if os.path.exists(md_path):
-            with open(md_path) as f:
-                existing_md = f.read()
+        try:
+            if os.path.exists(md_path):
+                with open(md_path) as f:
+                    existing_md = f.read()
 
-        if _MD_START not in existing_md:
-            with open(md_path, "a") as f:
-                if existing_md and not existing_md.endswith("\n"):
-                    f.write("\n")
-                f.write("\n" + _claude_md_block(self._skill_name))
+            if _MD_START not in existing_md:
+                with open(md_path, "a") as f:
+                    if existing_md and not existing_md.endswith("\n"):
+                        f.write("\n")
+                    f.write("\n" + _claude_md_block(self._skill_name))
+        except OSError as exc:
+            logger.error("cannot update %s: %s", md_path, exc)
+            raise
 
         return mcp_config_path
 
@@ -880,29 +904,9 @@ class Plugin:
         except KeyError:
             pass
 
-        # uid 1000 is the SteamOS default but not universal, so derive the
-        # runtime dir from the resolved desktop user instead of hardcoding it.
-        runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{_USER_UID}"
-        env["XDG_RUNTIME_DIR"] = runtime_dir
-
-        # Gaming Mode is a gamescope session: its socket is gamescope-N, which a
-        # wayland-N probe never matches. gamescopectl reads
-        # GAMESCOPE_WAYLAND_DISPLAY to reach the control protocol.
-        gamescope_socket = next(
-            (s for s in ("gamescope-0", "gamescope-1")
-             if os.path.exists(os.path.join(runtime_dir, s))),
-            None,
-        )
-        if gamescope_socket:
-            env.setdefault("GAMESCOPE_WAYLAND_DISPLAY", gamescope_socket)
-            env["WAYLAND_DISPLAY"] = gamescope_socket
-        else:
-            for wd in ["wayland-0", "wayland-1", "wayland-2"]:
-                if os.path.exists(os.path.join(runtime_dir, wd)):
-                    env["WAYLAND_DISPLAY"] = wd
-                    break
-        env.setdefault("DISPLAY", ":0")
-        return env
+        # Compositor variables are resolved in deck_common so this process and
+        # mcp_server.py cannot disagree about which session they are driving.
+        return deck_common.apply_display_env(env, _USER_UID)
 
     async def _take_screenshot(self, out_path: str) -> dict:
         env = self._display_env()
@@ -950,6 +954,16 @@ class Plugin:
                 return base64.b64encode(f.read(512 * 1024)).decode()
         except OSError:
             return None
+
+    async def _run_first(self, cmds: list[list[str]]) -> dict:
+        """Run the xdotool/ydotool alternatives until one succeeds, reporting
+        the last failure if none do."""
+        result = {"success": False, "error": "no command to run"}
+        for cmd in cmds:
+            result = await self._run_cmd(cmd)
+            if result["success"]:
+                return result
+        return result
 
     async def _run_cmd(self, cmd: list, env: dict | None = None, timeout: float = 8) -> dict:
         proc = None

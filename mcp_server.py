@@ -13,8 +13,16 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import urllib.error
 import urllib.request
+
+# Spawned by `claude` as a bare script, so the plugin directory is normally
+# sys.path[0] already — pin it anyway so the sibling module resolves no matter
+# how the interpreter was invoked.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import deck_common  # noqa: E402  (needs the sys.path anchor above)
 
 # Steam's CEF remote debugger (Decky Loader keeps it enabled)
 CEF_HOST = os.environ.get("DECKY_CLAUDE_CEF_HOST", "127.0.0.1")
@@ -23,29 +31,7 @@ CEF_PORT = int(os.environ.get("DECKY_CLAUDE_CEF_PORT", "8080"))
 # ── display environment ────────────────────────────────────────────────────────
 
 def _display_env() -> dict[str, str]:
-    env = dict(os.environ)
-    # uid 1000 is the SteamOS default but not universal — derive the runtime
-    # dir from the environment or the current user rather than hardcoding it.
-    runtime_dir = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
-    env["XDG_RUNTIME_DIR"] = runtime_dir
-    # Gaming Mode is a gamescope session: its socket is gamescope-N, which a
-    # wayland-N probe never matches. gamescopectl reads
-    # GAMESCOPE_WAYLAND_DISPLAY to reach the control protocol.
-    gamescope_socket = next(
-        (s for s in ("gamescope-0", "gamescope-1")
-         if os.path.exists(os.path.join(runtime_dir, s))),
-        None,
-    )
-    if gamescope_socket:
-        env.setdefault("GAMESCOPE_WAYLAND_DISPLAY", gamescope_socket)
-        env["WAYLAND_DISPLAY"] = gamescope_socket
-    else:
-        for wd in ["wayland-0", "wayland-1", "wayland-2"]:
-            if os.path.exists(os.path.join(runtime_dir, wd)):
-                env.setdefault("WAYLAND_DISPLAY", wd)
-                break
-    env.setdefault("DISPLAY", ":0")
-    return env
+    return deck_common.apply_display_env(dict(os.environ))
 
 def _run(cmd: list[str], timeout: float = 10) -> tuple[int, str]:
     env = _display_env()
@@ -283,12 +269,16 @@ TOOLS = [
 
 # ── tool handlers ──────────────────────────────────────────────────────────────
 
-_KEY_MAP = {
-    "escape": "KEY_ESC",
-    "Return": "KEY_ENTER",
-    "space": "KEY_SPACE",
-    "Tab": "KEY_TAB",
-}
+
+def _run_first(cmds: list[list[str]]) -> tuple[int, str, str]:
+    """Run each command until one succeeds; returns (rc, stderr, tool name)."""
+    rc, err, tool = 1, "no command to run", ""
+    for cmd in cmds:
+        tool = cmd[0]
+        rc, err = _run(cmd)
+        if rc == 0:
+            break
+    return rc, err, tool
 
 
 def _gamescope_screenshot(path: str) -> str | None:
@@ -337,40 +327,35 @@ def _handle_screenshot() -> list[dict]:
 
 
 def _handle_send_key(key: str) -> list[dict]:
-    rc, err = _run(["xdotool", "key", "--clearmodifiers", key])
+    rc, err, tool = _run_first(deck_common.key_commands(key))
     if rc == 0:
-        return [{"type": "text", "text": f"Key sent: {key}"}]
-    ydokey = _KEY_MAP.get(key, f"KEY_{key.upper()}")
-    rc, err = _run(["ydotool", "key", ydokey])
-    if rc == 0:
-        return [{"type": "text", "text": f"Key sent: {key} (ydotool)"}]
+        return [{"type": "text", "text": f"Key sent: {key} ({tool})"}]
     return [{"type": "text", "text": f"send_key failed for {key!r}: {err}"}]
 
 
 def _handle_type_text(text: str) -> list[dict]:
-    rc, err = _run(["xdotool", "type", "--clearmodifiers", "--delay", "20", "--", text])
+    rc, err, tool = _run_first(deck_common.type_commands(text))
     if rc == 0:
-        return [{"type": "text", "text": f"Typed: {text!r}"}]
-    rc, err = _run(["ydotool", "type", "--", text])
-    if rc == 0:
-        return [{"type": "text", "text": f"Typed: {text!r} (ydotool)"}]
+        return [{"type": "text", "text": f"Typed: {text!r} ({tool})"}]
     return [{"type": "text", "text": f"type_text failed: {err}"}]
 
 
 def _handle_mouse_move_click(x: int, y: int, button: str = "left") -> list[dict]:
-    btn_num = {"left": "1", "middle": "2", "right": "3"}.get(button, "1")
-    rc, err = _run(["xdotool", "mousemove", "--sync", str(x), str(y)])
-    if rc == 0:
-        rc2, err2 = _run(["xdotool", "click", btn_num])
-        if rc2 == 0:
-            return [{"type": "text", "text": f"Moved to ({x},{y}) and {button}-clicked"}]
-
-    # ydotool fallback
-    _run(["ydotool", "mousemove", "--", str(x), str(y)])
-    btn_code = {"left": "0xC0", "right": "0xC1", "middle": "0xC2"}.get(button, "0xC0")
-    rc, err = _run(["ydotool", "click", btn_code])
-    if rc == 0:
-        return [{"type": "text", "text": f"Moved to ({x},{y}) and {button}-clicked (ydotool)"}]
+    button = deck_common.normalize_button(button)
+    # Both lists are ordered xdotool-then-ydotool, so each pair is one backend:
+    # a move that lands with the other backend's click would move twice.
+    moves = deck_common.mouse_move_commands(x, y)
+    clicks = deck_common.click_commands(button)
+    err = "no input tool available"
+    for move, click in zip(moves, clicks):
+        rc, err = _run(move)
+        if rc != 0:
+            continue
+        rc, err = _run(click)
+        if rc == 0:
+            return [{"type": "text", "text": (
+                f"Moved to ({x},{y}) and {button}-clicked ({move[0]})"
+            )}]
     return [{"type": "text", "text": f"mouse_move_click failed: {err}"}]
 
 
@@ -417,22 +402,52 @@ def _handle_steam_ui_eval(expression: str, target: str) -> list[dict]:
     return [{"type": "text", "text": out}]
 
 
+class _ToolError(Exception):
+    """Unknown tool or unusable arguments — the caller's mistake, reported back
+    as an error result so the model can correct itself and retry."""
+
+
+def _require_str(tool: str, args: dict, name: str) -> str:
+    value = args.get(name)
+    if not isinstance(value, str) or not value:
+        raise _ToolError(
+            f"{tool}: argument {name!r} must be a non-empty string (got {value!r})"
+        )
+    return value
+
+
+def _require_int(tool: str, args: dict, name: str) -> int:
+    value = args.get(name)
+    # bool is an int subclass and never a sensible coordinate.
+    if not isinstance(value, bool):
+        try:
+            return int(value)  # models routinely send "640" rather than 640
+        except (TypeError, ValueError):
+            pass
+    raise _ToolError(f"{tool}: argument {name!r} must be an integer (got {value!r})")
+
+
 def _dispatch(name: str, args: dict) -> list[dict]:
     if name == "steam_ui_targets":
         return _handle_steam_ui_targets()
     if name == "steam_ui_eval":
-        return _handle_steam_ui_eval(
-            args.get("expression", ""), args.get("target", "SharedJSContext")
-        )
+        target = args.get("target") or "SharedJSContext"
+        if not isinstance(target, str):
+            raise _ToolError(f"{name}: argument 'target' must be a string (got {target!r})")
+        return _handle_steam_ui_eval(_require_str(name, args, "expression"), target)
     if name == "screenshot":
         return _handle_screenshot()
     if name == "send_key":
-        return _handle_send_key(args.get("key", ""))
+        return _handle_send_key(_require_str(name, args, "key"))
     if name == "type_text":
-        return _handle_type_text(args.get("text", ""))
+        return _handle_type_text(_require_str(name, args, "text"))
     if name == "mouse_move_click":
-        return _handle_mouse_move_click(args["x"], args["y"], args.get("button", "left"))
-    return [{"type": "text", "text": f"Unknown tool: {name}"}]
+        return _handle_mouse_move_click(
+            _require_int(name, args, "x"),
+            _require_int(name, args, "y"),
+            args.get("button", "left"),
+        )
+    raise _ToolError(f"Unknown tool: {name!r}")
 
 # ── JSON-RPC / MCP transport ───────────────────────────────────────────────────
 
@@ -460,8 +475,31 @@ def _handle(msg: dict) -> None:
         _send({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}})
     elif method == "tools/call":
         params = msg.get("params", {})
-        content = _dispatch(params.get("name", ""), params.get("arguments", {}))
-        _send({"jsonrpc": "2.0", "id": msg_id, "result": {"content": content, "isError": False}})
+        name = params.get("name", "")
+        args = params.get("arguments") or {}
+        is_error = False
+        if not isinstance(args, dict):
+            content = [{"type": "text", "text": f"{name}: 'arguments' must be an object"}]
+            is_error = True
+        else:
+            try:
+                content = _dispatch(name, args)
+            except _ToolError as exc:
+                content = [{"type": "text", "text": str(exc)}]
+                is_error = True
+            except Exception as exc:
+                # A handler that raises still has to answer: the client blocks
+                # on this id until the server exits, so an unhandled exception
+                # here hangs the whole session rather than failing one tool.
+                sys.stderr.write(f"mcp_server: {name} raised\n{traceback.format_exc()}")
+                content = [{"type": "text", "text": (
+                    f"{name} failed: {type(exc).__name__}: {exc}"
+                )}]
+                is_error = True
+        _send({
+            "jsonrpc": "2.0", "id": msg_id,
+            "result": {"content": content, "isError": is_error},
+        })
     elif msg_id is not None:
         _send({
             "jsonrpc": "2.0", "id": msg_id,
@@ -475,11 +513,20 @@ def main() -> None:
         if not raw:
             continue
         try:
-            _handle(json.loads(raw))
+            msg = json.loads(raw)
         except json.JSONDecodeError:
-            pass
+            continue  # a line that will not parse carries no id to answer on
+        try:
+            _handle(msg)
         except Exception as exc:
-            sys.stderr.write(f"mcp_server error: {exc}\n")
+            sys.stderr.write(f"mcp_server error: {traceback.format_exc()}")
+            # Anything with an id is a request the client is still waiting on.
+            msg_id = msg.get("id") if isinstance(msg, dict) else None
+            if msg_id is not None:
+                _send({
+                    "jsonrpc": "2.0", "id": msg_id,
+                    "error": {"code": -32603, "message": f"Internal error: {exc}"},
+                })
 
 
 if __name__ == "__main__":
