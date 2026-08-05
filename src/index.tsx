@@ -35,7 +35,7 @@ const getStatus = callable<
 const listDirs = callable<[], { dirs: string[] }>("list_dirs");
 
 const captureScreenshot = callable<
-  [],
+  [boolean],
   { success: boolean; path?: string; thumbnail?: string; error?: string }
 >("capture_screenshot");
 const getScreenState = callable<[], { thumbnail: string | null }>("get_screen_state");
@@ -160,6 +160,10 @@ function Content() {
   const [workingDir, setWorkingDir] = useState("");
   const [dirs, setDirs] = useState<string[]>([]);
   const [sessionLoading, setSessionLoading] = useState(false);
+  // Which action sessionLoading is for — `status` flips to "starting"
+  // (which isRunning treats as running) almost immediately after a start is
+  // kicked off, so isRunning can't be used to tell "starting" from "stopping".
+  const [sessionAction, setSessionAction] = useState<"start" | "stop" | null>(null);
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [urlCopied, setUrlCopied] = useState(false);
   const [skill, setSkill] = useState<string | null>(null);
@@ -182,6 +186,9 @@ function Content() {
   const [thumbnail, setThumbnail] = useState<string | null>(null);
   const [captureLoading, setCaptureLoading] = useState(false);
   const [captureError, setCaptureError] = useState<string | null>(null);
+  // gamescope excludes the Steam overlay (QAM, notifications) from a capture
+  // by default, same as the physical screenshot button — this opts in.
+  const [includeSteamUi, setIncludeSteamUi] = useState(false);
 
   // input
   const [typeText, setTypeText] = useState("");
@@ -304,7 +311,10 @@ function Content() {
       // A session started before the panel was opened still has to show what it
       // is resuming, so the backend's value wins while one is running.
       if (next === "running" || next === "starting") setResumeId(r.resume_id ?? "");
-      if (r.error) setSessionError(r.error);
+      // Mirror the backend's error exactly, including clearing it once the
+      // backend has — otherwise a resolved/stale error sticks in the panel
+      // forever since this poll never runs the "clear" branch.
+      setSessionError(r.error ?? null);
     } catch (e) {
       logPollFailure(e);
     }
@@ -313,6 +323,7 @@ function Content() {
   // ── session ──
   async function handleStartSession() {
     setSessionLoading(true);
+    setSessionAction("start");
     setSessionError(null);
     try {
       const r = await startSession(workingDir, resumeId);
@@ -328,11 +339,13 @@ function Content() {
       setSessionError(errorText(e, "Failed to start session"));
     } finally {
       setSessionLoading(false);
+      setSessionAction(null);
     }
   }
 
   async function handleStopSession() {
     setSessionLoading(true);
+    setSessionAction("stop");
     try {
       await stopSession();
       setStatus("stopped");
@@ -345,6 +358,7 @@ function Content() {
       setSessionError(errorText(e, "Failed to stop session"));
     } finally {
       setSessionLoading(false);
+      setSessionAction(null);
     }
   }
 
@@ -365,7 +379,7 @@ function Content() {
     setCaptureLoading(true);
     setCaptureError(null);
     try {
-      const r = await captureScreenshot();
+      const r = await captureScreenshot(includeSteamUi);
       if (r.success && r.thumbnail) {
         setThumbnail(r.thumbnail);
       } else if (!r.success) {
@@ -605,7 +619,7 @@ function Content() {
             disabled={sessionLoading}
           >
             {sessionLoading
-              ? isRunning ? "Stopping…" : "Starting…"
+              ? sessionAction === "stop" ? "Stopping…" : "Starting…"
               : isRunning ? "Stop Session"
               : resumeId ? "Resume Session"
               : "Start Remote Session"}
@@ -722,6 +736,15 @@ function Content() {
         )}
 
         <PanelSectionRow>
+          <ToggleField
+            label="Include Steam UI"
+            description="Also capture the Quick Access Menu / overlay, not just the game"
+            checked={includeSteamUi}
+            onChange={setIncludeSteamUi}
+          />
+        </PanelSectionRow>
+
+        <PanelSectionRow>
           <ButtonItem layout="below" onClick={handleCapture} disabled={captureLoading}>
             {captureLoading ? "Capturing…" : "Capture Screen"}
           </ButtonItem>
@@ -734,8 +757,11 @@ function Content() {
         )}
 
         <PanelSectionRow>
-          <div style={{ fontSize: 11, color: "#555" }}>
-            Claude captures automatically when you message it. This button is for your own preview.
+          <div style={{ fontSize: 11, color: "#555", lineHeight: 1.4 }}>
+            For your own preview — Claude captures on its own when you ask it
+            something. By default a capture is the game/desktop frame only,
+            same as the physical screenshot button; the overlay shown here
+            isn't part of it unless "Include Steam UI" is on.
           </div>
         </PanelSectionRow>
       </PanelSection>

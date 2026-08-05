@@ -216,9 +216,26 @@ TOOLS = [
         "description": (
             "Capture the current screen (game, UI, error dialog, desktop). "
             "Call this at the start of any request that involves the game or "
-            "visual state before answering. Returns a PNG image."
+            "visual state before answering. Returns a PNG image. By default "
+            "this captures the game's own frame only, same as the physical "
+            "screenshot button — the Steam overlay (Quick Access Menu, "
+            "notifications) is not part of it. Pass include_steam_ui=true "
+            "when debugging the QAM or an overlay dialog itself."
         ),
-        "inputSchema": {"type": "object", "properties": {}, "required": []},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "include_steam_ui": {
+                    "type": "boolean",
+                    "description": (
+                        "Include the Steam overlay (QAM, notifications) in the "
+                        "capture instead of just the game/desktop frame."
+                    ),
+                    "default": False,
+                },
+            },
+            "required": [],
+        },
     },
     {
         "name": "send_key",
@@ -305,7 +322,26 @@ def _run_first(cmds: list[list[str]]) -> tuple[int, str, str]:
     return rc, err, tool
 
 
-def _gamescope_screenshot(path: str) -> str | None:
+# gamescope's "screenshot" control command is normally invoked with just a
+# path (-> base_plane_only, the game's own frame, no overlays — the same as
+# the controller's physical screenshot button). gamescopectl's CLI only ever
+# forwards argv[1] (the command) and argv[2] (one opaque string) to the
+# compositor, so a second argument has to be smuggled in as extra
+# whitespace-separated tokens inside that one string — gamescope's own
+# "screenshot" console command then re-splits it into <path> <type>, per its
+# `screenshot_type` enum (protocol/gamescope-control.xml):
+#   1 base_plane_only  — game only, no color mgmt applied              (default)
+#   2 all_real_layers  — game + overlays (Steam QAM, notifications), no color mgmt
+#   3 full_composition — every layer, no color mgmt/mura
+#   4 screen_buffer    — the exact on-screen buffer, 1:1 (incl. QAM, color mgmt intact)
+# screen_buffer is what "include Steam UI" asks for: it's what the display is
+# actually showing, cursor and QAM included. Unverified on hardware — the
+# gamescope side of this re-split is inferred from its ConCommand handler,
+# not tested end to end.
+_SCREENSHOT_TYPE_SCREEN_BUFFER = 4
+
+
+def _gamescope_screenshot(path: str, include_steam_ui: bool = False) -> str | None:
     """Capture via gamescope, or an error string explaining why not.
 
     This plugin targets Gaming Mode only, so capture goes through gamescope and
@@ -320,9 +356,10 @@ def _gamescope_screenshot(path: str) -> str | None:
     if not env.get("GAMESCOPE_WAYLAND_DISPLAY"):
         return "not running under gamescope — screen capture needs Gaming Mode"
 
+    arg = f"{path} {_SCREENSHOT_TYPE_SCREEN_BUFFER}" if include_steam_ui else path
     # Outside a live gamescope, gamescopectl still exits 0 after failing to
     # connect, so the file itself is the only trustworthy success signal.
-    rc, err = _run(["gamescopectl", "screenshot", path], timeout=15)
+    rc, err = _run(["gamescopectl", "screenshot", arg], timeout=15)
     if rc != 0:
         return err or "gamescopectl failed"
     # gamescope writes the file from its own render thread, so it can land
@@ -334,11 +371,11 @@ def _gamescope_screenshot(path: str) -> str | None:
     return "gamescope produced no screenshot"
 
 
-def _handle_screenshot() -> list[dict]:
+def _handle_screenshot(include_steam_ui: bool = False) -> list[dict]:
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         path = f.name
 
-    failure = _gamescope_screenshot(path)
+    failure = _gamescope_screenshot(path, include_steam_ui)
     if failure:
         if os.path.exists(path):
             os.unlink(path)
@@ -616,7 +653,7 @@ def _dispatch(name: str, args: dict) -> list[dict]:
     if name == "steam_snippet":
         return _handle_steam_snippet(_require_str(name, args, "name"))
     if name == "screenshot":
-        return _handle_screenshot()
+        return _handle_screenshot(bool(args.get("include_steam_ui", False)))
     if name == "send_key":
         return _handle_send_key(_require_str(name, args, "key"))
     if name == "type_text":

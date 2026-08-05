@@ -27,7 +27,7 @@ will simply report that it needs Gaming Mode.
 
 1. **Phone-controlled Claude Code** — the plugin launches `claude --remote-control` (remote control) in a working directory you pick and shows the `https://claude.ai/code/session_…` URL in the panel. Open it in the Claude app and drive the session from your phone.
 2. **Steam UI debugger (the main event)** — Steam's Gaming Mode UI is embedded Chromium (CEF) with its DevTools debugger on `localhost:8080` (Decky itself relies on it). Claude gets `steam_ui_eval`: it runs JavaScript inside Steam over the Chrome DevTools Protocol, inspects the `SteamClient` API, reads real client state (downloads, library, settings, login), and triggers real actions — no pixel-hunting.
-3. **Eyes and hands** — `screenshot` returns what's on screen as an image; `send_key` / `type_text` / `mouse_move_click` inject input via `xdotool`/`ydotool`. This covers everything that isn't Steam's own UI (dialogs, games).
+3. **Eyes and hands** — `screenshot` returns what's on screen as an image; `send_key` / `type_text` / `mouse_move_click` inject input via `xdotool`/`ydotool`. By default a capture is the game/desktop frame only — the same base-plane-only frame the physical screenshot button captures, with the Steam overlay (Quick Access Menu, notifications) excluded. Pass `include_steam_ui: true` (or flip the panel's toggle) to capture the overlay too.
 4. **steam-debugger skill, autoloaded** — a bundled Claude Code skill encodes the debugging workflow (interrogate Steam UI first, log locations, least-invasive-fix rules, safety rails). It is linked into every session and Claude is instructed to load it at session start. A personal copy in `~/.claude/skills/` (any folder named like *steam…debug…*) overrides the bundled one.
 
 In-game help (asking Claude about the game you're playing) works through the same screenshot/input tools, but it's a nice-to-have — the tooling is tuned for Steam debugging.
@@ -61,7 +61,7 @@ Everything injected into the working directory (`.mcp.json`, the `CLAUDE.md` blo
 | `steam_snippet` | Run a curated, pre-verified SteamClient query (downloads, login, library, running, client info, refresh, updates) |
 | `steam_ui_targets` | List Steam's live UI pages (CDP targets) |
 | `steam_ui_eval` | Run JavaScript inside the Steam client (`SharedJSContext` = `SteamClient` API) |
-| `screenshot` | Capture the display, returned as a PNG image |
+| `screenshot` | Capture the display, returned as a PNG image. Game/desktop frame only by default; `include_steam_ui: true` also captures the Steam overlay (QAM, notifications) — unverified on hardware |
 | `send_key` | Key press to the focused window |
 | `type_text` | Type a string |
 | `mouse_move_click` | Move to (x, y) and click (1280×800 native) |
@@ -117,7 +117,7 @@ Copy the plugin folder (containing `dist/`, `skills/`, `main.py`, `mcp_server.py
 4. Describe the problem ("downloads are stuck", "Steam won't stay logged in", "X crashes at the menu"). Claude loads the steam-debugger skill, inspects Steam from the inside, reads logs, screenshots the screen, and walks the fix with you.
 5. Stop the session from the panel when done — all injected config is cleaned up.
 
-The panel also offers a manual screenshot preview and manual key/mouse/text input for when you want to poke the Deck yourself.
+The panel's **Screen Preview** section is for you, not Claude — Claude captures on its own via the `screenshot` MCP tool whenever it needs to see something. The panel's **Capture Screen** button gives you the same view without spinning up a session: useful to sanity-check the capture pipeline, or just to glance at the Deck's screen from the Quick Access menu. It works even with no session running. By default it captures the game/desktop frame only (same as the physical screenshot button); toggle **Include Steam UI** on to capture the Quick Access Menu / overlay instead. The panel also offers manual key/mouse/text input for when you want to poke the Deck yourself.
 
 ## Repository layout
 
