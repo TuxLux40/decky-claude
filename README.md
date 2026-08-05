@@ -1,3 +1,5 @@
+<img src="assets/glyph.png" alt="" width="96" height="96" align="right">
+
 # decky-claude
 
 A [Decky Loader](https://decky.xyz/) plugin that starts a **Claude Code session on your Steam Deck that you control from your phone** — built first and foremost to debug **Steam and the Steam UI** without leaving Gaming Mode.
@@ -130,6 +132,7 @@ The panel's **Screen Preview** section is for you, not Claude — Claude capture
 | `src/index.tsx` | Quick Access panel (React, built to `dist/` by rollup) |
 | `skills/steam-debugger/` | Bundled Claude Code skill, autoloaded into sessions |
 | `.github/workflows/release.yml` | Builds and packages `decky-claude.zip` on `v*` tags |
+| `assets/` | Plugin icon (D-pad + Claude spark) as SVG source and PNG |
 
 ## Roadmap
 
