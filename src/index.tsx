@@ -631,6 +631,15 @@ function Content() {
       {/* ── Sessions on this machine ───────────────────────────────────── */}
       {machineSessions.length > 0 && (
         <PanelSection title="Sessions on this device">
+          {/* DialogButton applies its own background/border via focus/hover
+              CSS that otherwise beats the inline style below, so the selected
+              state needs !important to actually show. */}
+          <style>{`
+            .decky-claude-session-row[data-selected="true"] {
+              background: rgba(91,163,245,0.18) !important;
+              border-color: rgba(91,163,245,0.6) !important;
+            }
+          `}</style>
           {machineSessions.map((s) => {
             const selected = s.id === resumeId;
             const selectable = !s.live && !isRunning;
@@ -641,6 +650,8 @@ function Content() {
                   // them: the Quick Access panel scrolls to whatever has focus,
                   // and unfocusable content is a dead end for gamepad users.
                   onClick={() => selectable && setResumeId(selected ? "" : s.id)}
+                  className="decky-claude-session-row"
+                  data-selected={selected}
                   style={{
                     width: "100%", minWidth: 0, padding: "6px 8px",
                     textAlign: "left", display: "flex", alignItems: "center", gap: 8,
