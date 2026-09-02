@@ -160,6 +160,10 @@ function Content() {
   const [workingDir, setWorkingDir] = useState("");
   const [dirs, setDirs] = useState<string[]>([]);
   const [sessionLoading, setSessionLoading] = useState(false);
+  // Which action sessionLoading is for — `status` flips to "starting"
+  // (which isRunning treats as running) almost immediately after a start is
+  // kicked off, so isRunning can't be used to tell "starting" from "stopping".
+  const [sessionAction, setSessionAction] = useState<"start" | "stop" | null>(null);
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [urlCopied, setUrlCopied] = useState(false);
   const [skill, setSkill] = useState<string | null>(null);
@@ -295,6 +299,10 @@ function Content() {
       const next = parseStatus(r.status);
       if (next) {
         setStatus(next);
+        // Mirror the backend's error exactly, including clearing it once the
+        // backend has — otherwise a resolved/stale error sticks in the panel
+        // forever since this poll never ran the "clear" branch.
+        setSessionError(r.error ?? null);
       } else {
         setStatus("error");
         setSessionError(`Backend reported an unknown status: ${String(r.status)}`);
@@ -304,7 +312,6 @@ function Content() {
       // A session started before the panel was opened still has to show what it
       // is resuming, so the backend's value wins while one is running.
       if (next === "running" || next === "starting") setResumeId(r.resume_id ?? "");
-      if (r.error) setSessionError(r.error);
     } catch (e) {
       logPollFailure(e);
     }
@@ -313,12 +320,14 @@ function Content() {
   // ── session ──
   async function handleStartSession() {
     setSessionLoading(true);
+    setSessionAction("start");
     setSessionError(null);
     try {
       const r = await startSession(workingDir, resumeId);
       if (r.success) {
         setStatus("running");
         setSessionUrl(r.url ?? null);
+        setSessionError(null);
       } else {
         setStatus("error");
         setSessionError(r.error ?? "Failed to start session");
@@ -328,11 +337,13 @@ function Content() {
       setSessionError(errorText(e, "Failed to start session"));
     } finally {
       setSessionLoading(false);
+      setSessionAction(null);
     }
   }
 
   async function handleStopSession() {
     setSessionLoading(true);
+    setSessionAction("stop");
     try {
       await stopSession();
       setStatus("stopped");
@@ -345,6 +356,7 @@ function Content() {
       setSessionError(errorText(e, "Failed to stop session"));
     } finally {
       setSessionLoading(false);
+      setSessionAction(null);
     }
   }
 
@@ -605,7 +617,7 @@ function Content() {
             disabled={sessionLoading}
           >
             {sessionLoading
-              ? isRunning ? "Stopping…" : "Starting…"
+              ? sessionAction === "stop" ? "Stopping…" : "Starting…"
               : isRunning ? "Stop Session"
               : resumeId ? "Resume Session"
               : "Start Remote Session"}
@@ -631,6 +643,15 @@ function Content() {
       {/* ── Sessions on this machine ───────────────────────────────────── */}
       {machineSessions.length > 0 && (
         <PanelSection title="Sessions on this device">
+          {/* DialogButton applies its own background/border via focus/hover
+              CSS that otherwise beats the inline style below, so the selected
+              state needs !important to actually show. */}
+          <style>{`
+            .decky-claude-session-row[data-selected="true"] {
+              background: rgba(91,163,245,0.18) !important;
+              border-color: rgba(91,163,245,0.6) !important;
+            }
+          `}</style>
           {machineSessions.map((s) => {
             const selected = s.id === resumeId;
             const selectable = !s.live && !isRunning;
@@ -641,6 +662,8 @@ function Content() {
                   // them: the Quick Access panel scrolls to whatever has focus,
                   // and unfocusable content is a dead end for gamepad users.
                   onClick={() => selectable && setResumeId(selected ? "" : s.id)}
+                  className="decky-claude-session-row"
+                  data-selected={selected}
                   style={{
                     width: "100%", minWidth: 0, padding: "6px 8px",
                     textAlign: "left", display: "flex", alignItems: "center", gap: 8,

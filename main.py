@@ -28,6 +28,13 @@ _URL_PATTERN = re.compile(r"https://claude\.ai/code/session_[A-Za-z0-9_-]+")
 # `claude auth login` prints its OAuth URL wrapped in an OSC-8 hyperlink, so
 # stop at ESC/BEL/] rather than whitespace.
 _OAUTH_URL = re.compile(r"https://[^\s\x1b\x07\]]*/oauth/[^\s\x1b\x07\]]+")
+# Claude 2.1+ blocks `--resume` of a large/old transcript on an interactive
+# picker ("Resume from summary?"). A remote-control session has no one at the
+# keyboard, so that prompt is why Resume Session looked like a fresh start.
+_RESUME_PROMPT = re.compile(
+    r"Resume from summary \(recommended\)|Resuming the full session will consume",
+    re.I,
+)
 
 # Sentinel used to mark the block we inject into CLAUDE.md
 _MD_START = "<!-- decky-claude-start -->"
@@ -270,6 +277,7 @@ class Plugin:
         for _ in range(40):
             if self._session_url:
                 self._status = "running"
+                self._error_msg = None
                 return {"success": True, "url": self._session_url}
             if self._process.returncode is not None:
                 self._status = "error"
@@ -457,7 +465,7 @@ class Plugin:
         read the real cwd out of the transcript instead.
         """
         root = os.path.join(_USER_HOME, ".claude", "projects")
-        live = self._live_session_cwds()
+        live = self._live_session_ids()
         entries = []
         try:
             for project in os.listdir(root):
@@ -489,7 +497,7 @@ class Plugin:
                 "label": os.path.basename(cwd.rstrip("/")) or cwd,
                 "preview": self._session_preview(path, mtime),
                 "mtime": int(mtime),
-                "live": cwd in live,
+                "live": session_id in live,
                 "current": session_id == self._session_id and self._status == "running",
             })
         return {"sessions": sessions}
@@ -601,14 +609,17 @@ class Plugin:
         return None
 
     @staticmethod
-    def _live_session_cwds() -> set:
-        """cwds of running claude processes owned by this user.
+    def _live_session_ids() -> set:
+        """Session ids of running ``claude`` processes owned by this user.
 
-        Other users' processes are deliberately skipped: /proc/<pid>/cwd is not
-        readable across uids, so they could only ever be reported as unknown.
+        Live used to be keyed by cwd, which made every transcript in
+        /home/oliver un-resumable whenever any Claude Code was open there —
+        the default working directory, so Resume Session had nothing to pick.
+        ``--session-id`` / ``--resume`` on the argv is the actual occupancy.
         """
         uid = os.getuid()
-        cwds = set()
+        ids: set[str] = set()
+        flags = {b"--resume", b"-r", b"--session-id"}
         for pid in os.listdir("/proc"):
             if not pid.isdigit():
                 continue
@@ -624,11 +635,12 @@ class Plugin:
             # which would otherwise match a substring test against its own cwd.
             if not argv or os.path.basename(argv[0] or b"") != b"claude":
                 continue
-            try:
-                cwds.add(os.readlink(f"{base}/cwd"))
-            except OSError:
-                continue
-        return cwds
+            for i, arg in enumerate(argv):
+                if arg in flags and i + 1 < len(argv):
+                    sid = argv[i + 1].decode("utf-8", errors="replace").strip()
+                    if sid and not sid.startswith("-"):
+                        ids.add(sid)
+        return ids
 
     async def list_dirs(self):
         base = _USER_HOME
@@ -928,6 +940,13 @@ class Plugin:
         except KeyError:
             pass
 
+        # Skip the stale-resume confirmation dialog. Thresholds are the age
+        # (minutes) and token count at which `claude --resume` asks "summary
+        # or full session?" — a question nobody can answer from the QAM.
+        # The PTY still auto-confirms if a future CLI ignores these.
+        env.setdefault("CLAUDE_CODE_RESUME_THRESHOLD_MINUTES", "999999")
+        env.setdefault("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD", "999999999")
+
         # Compositor variables are resolved in deck_common so this process and
         # mcp_server.py cannot disagree about which session they are driving.
         return deck_common.apply_display_env(env, _USER_UID)
@@ -1040,10 +1059,30 @@ class Plugin:
                 return path
         return None
 
+    def _adopt_session_url(self, text: str) -> None:
+        """Pull a remote-control URL out of CLI output if we don't have one yet.
+
+        The TUI wraps with ``\\r`` and often omits a trailing newline, so this
+        has to search the full decoded buffer, not only newline-split lines.
+        Finding a URL means the session started — any earlier banner line that
+        looked like an error (MCP auth notices contain the substring "auth")
+        was not fatal and must not stay stuck in the QAM.
+        """
+        if self._session_url:
+            return
+        match = _URL_PATTERN.search(text)
+        if not match:
+            return
+        self._session_url = match.group(0)
+        if self._status == "starting":
+            self._status = "running"
+        self._error_msg = None
+
     async def _drain_output(self):
         loop = asyncio.get_event_loop()
         fd = self._pty_master_fd
         buf = b""
+        answered_resume_prompt = False
         try:
             while True:
                 try:
@@ -1054,6 +1093,24 @@ class Plugin:
                 if not chunk:
                     break
                 buf += chunk
+                # Search the whole buffer so a URL sitting after a carriage
+                # return (no newline yet) is still picked up.
+                decoded = _ANSI_ESCAPE.sub("", buf.decode("utf-8", errors="replace"))
+                self._adopt_session_url(decoded)
+                if (
+                    not answered_resume_prompt
+                    and self._resume_id
+                    and _RESUME_PROMPT.search(decoded)
+                ):
+                    # Option 2 = "Resume full session as-is". Enter alone would
+                    # take the recommended summary, which drops the transcript
+                    # the user asked to pick up.
+                    try:
+                        os.write(fd, b"2\r")
+                        answered_resume_prompt = True
+                        logger.info("auto-confirmed resume prompt (full session)")
+                    except OSError:
+                        pass
                 while b"\n" in buf:
                     raw, buf = buf.split(b"\n", 1)
                     line = _ANSI_ESCAPE.sub("", raw.decode("utf-8", errors="replace")).strip()
@@ -1061,15 +1118,12 @@ class Plugin:
                         continue
                     logger.info("claude: %s", line)
                     self._log_lines.append(line)
-                    match = _URL_PATTERN.search(line)
-                    if match and not self._session_url:
-                        self._session_url = match.group(0)
-                        if self._status == "starting":
-                            self._status = "running"
-                    lower = line.lower()
-                    if any(kw in lower for kw in ("not logged in", "api key", "auth", "error")):
-                        if self._status == "starting":
-                            self._error_msg = line
+                    self._adopt_session_url(line)
+                    # Real login failures make `--remote-control` exit, which
+                    # start_session already reports. Do not treat "auth" or
+                    # "error" as fatal: the startup banner says "MCP server
+                    # needs authentication" and that was showing as a red
+                    # error in the QAM even after the session URL arrived.
         except Exception as exc:
             logger.error("drain_output error: %s", exc)
         finally:
