@@ -65,6 +65,19 @@ Rules for `steam_ui_eval`:
 3. Combine with `screenshot` to correlate internal state with what the user
    sees.
 
+## `send_key` / `mouse_move_click` "success" is not proof of anything
+
+These report success whenever the underlying `xdotool`/`ydotool` process
+exits 0 — and `ydotool key` exits 0 even when given garbage it can't
+interpret, silently doing nothing instead of erroring. A batch of "Key sent"
+results does not mean the game or the Steam UI actually received them.
+**Always confirm with a follow-up `screenshot`** that the thing you expected
+to change actually changed. If nothing moves after several attempts, don't
+jump to "this UI only accepts a real controller" — check the input backends
+are actually functional first: `which xdotool` and
+`systemctl --user is-active ydotool.service`. If either is missing, that is
+the bug, not the target application.
+
 ## Workflow
 
 1. **Look first.** `screenshot` before anything else — error dialogs and

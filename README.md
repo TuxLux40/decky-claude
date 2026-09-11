@@ -75,8 +75,14 @@ Everything injected into the working directory (`.mcp.json`, the `CLAUDE.md` blo
 npm install -g @anthropic-ai/claude-code
 claude
 
-# gamescopectl ships with gamescope; ydotool is optional
+# gamescopectl ships with gamescope
 which gamescopectl
+
+# send_key/type_text/mouse_move_click need xdotool (primary) and ydotool
+# (fallback for pure-Wayland sessions with no XWayland). Neither ships by
+# default and the plugin backend runs unprivileged, so this can't be done
+# for you automatically — run it once yourself:
+./scripts/setup-input-tools.sh
 ```
 
 Decky Loader must be installed — it also keeps Steam's CEF debugger enabled, which `steam_ui_eval` needs.

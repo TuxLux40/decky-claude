@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import fcntl
 import glob
 import json
 import logging
@@ -8,6 +9,7 @@ import pty
 import pwd
 import re
 import sys
+import termios
 import uuid
 from collections import OrderedDict
 
@@ -22,6 +24,18 @@ import deck_common  # noqa: E402  (needs the sys.path anchor above)
 import machine_profile  # noqa: E402
 
 logger = logging.getLogger("decky-claude")
+
+
+def _become_controlling_tty():
+    """preexec_fn for pty-backed subprocesses: fd 0 is already dup'd to the
+    pty slave by the time this runs, but an inherited fd is never
+    auto-adopted as the controlling terminal on Linux — only setsid() +
+    TIOCSCTTY does that. Without this, whether `sudo`/`pkexec` inside the
+    spawned `claude` find a controlling terminal is down to accidental
+    leftover session state, not this fd wiring.
+    """
+    os.setsid()
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
 _ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _URL_PATTERN = re.compile(r"https://claude\.ai/code/session_[A-Za-z0-9_-]+")
@@ -261,6 +275,7 @@ class Plugin:
                 stdout=slave_fd,
                 stderr=slave_fd,
                 stdin=slave_fd,
+                preexec_fn=_become_controlling_tty,
             )
         except Exception as exc:
             os.close(slave_fd)
@@ -389,6 +404,7 @@ class Plugin:
                 stdout=slave_fd,
                 stderr=slave_fd,
                 stdin=slave_fd,
+                preexec_fn=_become_controlling_tty,
             )
         except Exception as exc:
             os.close(slave_fd)

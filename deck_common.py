@@ -97,10 +97,16 @@ def key_commands(key: str) -> list[list[str]]:
 
     ydotool only works with a running ydotoold and access to /dev/uinput, so it
     is the fallback for when there is no X server (or XWayland) to talk to.
+
+    ydotool's `key` subcommand takes `<code>:<pressed>` pairs, not a bare key
+    name — a bare name is a "non-interpretable value" that ydotool silently
+    treats as a no-op delay while still exiting 0, so this must send an
+    explicit press (":1") then release (":0") or nothing happens at all.
     """
+    code = ydotool_key(key)
     return [
         ["xdotool", "key", "--clearmodifiers", "--", key],
-        ["ydotool", "key", "--", ydotool_key(key)],
+        ["ydotool", "key", "--", f"{code}:1", f"{code}:0"],
     ]
 
 
