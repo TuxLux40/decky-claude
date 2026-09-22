@@ -181,6 +181,12 @@ function Content() {
   const [machineSessions, setMachineSessions] = useState<MachineSession[]>([]);
   // "" = start a fresh session; otherwise the transcript id to resume
   const [resumeId, setResumeId] = useState("");
+  // Has the user explicitly picked a session (or "New session") this time
+  // round? Until they do, the panel defaults to resuming whatever was most
+  // recently left hanging — a plugin/backend restart (or just closing the
+  // panel mid-task) otherwise silently drops you into a brand new session
+  // with no sign anything was interrupted.
+  const [resumeChosen, setResumeChosen] = useState(false);
 
   // screen
   const [thumbnail, setThumbnail] = useState<string | null>(null);
@@ -218,6 +224,15 @@ function Content() {
     const id = setInterval(syncMachineSessions, 10000);
     return () => clearInterval(id);
   }, []);
+
+  // Default to resuming the most recent non-live session until the user says
+  // otherwise, so the button reads "Resume Session" against whatever got
+  // interrupted instead of quietly offering a fresh one.
+  useEffect(() => {
+    if (resumeChosen || status === "running" || status === "starting") return;
+    const candidate = machineSessions.find((s) => !s.live);
+    if (candidate && candidate.id !== resumeId) setResumeId(candidate.id);
+  }, [machineSessions, resumeChosen, status]);
 
   async function syncAuth() {
     try {
@@ -350,6 +365,7 @@ function Content() {
       setSessionUrl(null);
       setSessionError(null);
       setResumeId("");
+      setResumeChosen(false);
     } catch (e) {
       // The process may well still be alive, so leave the status alone and let
       // the poll report what actually happened.
@@ -590,7 +606,7 @@ function Content() {
                   })),
                 ]}
                 selectedOption={resumeId}
-                onChange={(opt) => setResumeId(opt.data)}
+                onChange={(opt) => { setResumeId(opt.data); setResumeChosen(true); }}
               />
             </PanelSectionRow>
 
@@ -644,12 +660,18 @@ function Content() {
       {machineSessions.length > 0 && (
         <PanelSection title="Sessions on this device">
           {/* DialogButton applies its own background/border via focus/hover
-              CSS that otherwise beats the inline style below, so the selected
-              state needs !important to actually show. */}
+              CSS that otherwise beats the inline style below — that CSS wins
+              specifically while a row has D-pad focus, i.e. exactly while the
+              user is looking at it to judge what's selected. The doubled
+              class raises specificity above a single-class selector, and the
+              :hover/:focus variants make sure the selected look survives
+              those states rather than just the resting one. */}
           <style>{`
-            .decky-claude-session-row[data-selected="true"] {
-              background: rgba(91,163,245,0.18) !important;
-              border-color: rgba(91,163,245,0.6) !important;
+            .decky-claude-session-row.decky-claude-session-row[data-selected="true"],
+            .decky-claude-session-row.decky-claude-session-row[data-selected="true"]:hover,
+            .decky-claude-session-row.decky-claude-session-row[data-selected="true"]:focus {
+              background-color: rgba(91,163,245,0.22) !important;
+              border-color: rgba(91,163,245,0.85) !important;
             }
           `}</style>
           {machineSessions.map((s) => {
@@ -661,7 +683,11 @@ function Content() {
                   // Rows are buttons rather than divs so the D-pad can reach
                   // them: the Quick Access panel scrolls to whatever has focus,
                   // and unfocusable content is a dead end for gamepad users.
-                  onClick={() => selectable && setResumeId(selected ? "" : s.id)}
+                  onClick={() => {
+                    if (!selectable) return;
+                    setResumeId(selected ? "" : s.id);
+                    setResumeChosen(true);
+                  }}
                   className="decky-claude-session-row"
                   data-selected={selected}
                   style={{
@@ -701,9 +727,21 @@ function Content() {
                       overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
                     }}>
                       {s.live ? "running" : relativeTime(s.mtime)} · {s.short_id}
-                      {selected ? " · will resume" : ""}
+                      {/* Once the resume actually started, "will resume" is
+                          just wrong — s.current already says it's live here. */}
+                      {selected && !isRunning ? " · will resume" : ""}
                     </div>
                   </div>
+                  {/* Text content, not CSS — stays visible even if DialogButton's
+                      own focus/hover styling wins the background fight above. */}
+                  {selected && (
+                    <div
+                      aria-hidden
+                      style={{ fontSize: 14, color: "#5ba3f5", flexShrink: 0, lineHeight: 1 }}
+                    >
+                      ✓
+                    </div>
+                  )}
                 </DialogButton>
               </PanelSectionRow>
             );

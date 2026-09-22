@@ -473,7 +473,7 @@ class Plugin:
 
     # ── other sessions on this machine ─────────────────────────────────────────
 
-    async def list_sessions(self, limit: int = 8):
+    async def list_sessions(self, limit: int = 3):
         """Recent Claude Code sessions belonging to this user.
 
         Transcripts live in ~/.claude/projects/<encoded-cwd>/<session>.jsonl.
