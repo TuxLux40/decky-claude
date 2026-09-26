@@ -434,6 +434,7 @@ function Content() {
   // A live session is already attached to a claude process; resuming it a
   // second time would run two clients against one transcript.
   const resumable = machineSessions.filter((s) => !s.live);
+  const liveElsewhere = machineSessions.filter((s) => s.live && !s.current).length;
   const resumeSession = machineSessions.find((s) => s.id === resumeId) ?? null;
   const statusColor = STATUS_COLOR[status] ?? "#888";
   const statusLabel =
@@ -599,6 +600,15 @@ function Content() {
               />
             </PanelSectionRow>
 
+            {liveElsewhere > 0 && (
+              <PanelSectionRow>
+                <div style={{ fontSize: 10, color: "#888", lineHeight: 1.4 }}>
+                  {liveElsewhere} more running elsewhere on this device — open{" "}
+                  {liveElsewhere === 1 ? "it" : "them"} from the Claude app.
+                </div>
+              </PanelSectionRow>
+            )}
+
             {/* Resuming replays a transcript, and that only works in the
                 directory it was recorded in — so the backend picks the cwd. */}
             {!resumeId && (
@@ -644,106 +654,6 @@ function Content() {
           </PanelSectionRow>
         )}
       </PanelSection>
-
-      {/* ── Sessions on this machine ───────────────────────────────────── */}
-      {machineSessions.length > 0 && (
-        <PanelSection title="Sessions on this device">
-          {/* Steam marks D-pad focus with a .gpfocus class (not :focus), and an
-              inline background would silently beat it — so all row colours
-              live here, and focus is declared last so it wins over selected. */}
-          <style>{`
-            button.DialogButton.decky-claude-session-row {
-              background: rgba(255,255,255,0.04) !important;
-              border: 1px solid transparent !important;
-            }
-            button.DialogButton.decky-claude-session-row[data-selected="true"] {
-              background: rgba(91,163,245,0.22) !important;
-              border-color: rgba(91,163,245,0.85) !important;
-            }
-            button.DialogButton.decky-claude-session-row.gpfocus,
-            button.DialogButton.decky-claude-session-row:hover {
-              background: rgb(70,77,88) !important;
-              border-color: rgba(255,255,255,0.9) !important;
-            }
-            button.DialogButton.decky-claude-session-row.gpfocus[data-selected="true"],
-            button.DialogButton.decky-claude-session-row[data-selected="true"]:hover {
-              background: rgba(91,163,245,0.45) !important;
-              border-color: #fff !important;
-            }
-          `}</style>
-          {machineSessions.map((s) => {
-            const selected = s.id === resumeId;
-            const selectable = !s.live && !isRunning;
-            return (
-              <PanelSectionRow key={s.id}>
-                <DialogButton
-                  // Rows are buttons rather than divs so the D-pad can reach
-                  // them: the Quick Access panel scrolls to whatever has focus,
-                  // and unfocusable content is a dead end for gamepad users.
-                  onClick={() => selectable && setResumeId(s.id)}
-                  className="decky-claude-session-row"
-                  data-selected={selected}
-                  style={{
-                    width: "100%", minWidth: 0, padding: "6px 8px",
-                    textAlign: "left", display: "flex", alignItems: "center", gap: 8,
-                  }}
-                >
-                  <div
-                    style={{
-                      width: 8, height: 8, borderRadius: "50%", flexShrink: 0,
-                      background: s.live ? "#4caf50" : "#555",
-                      boxShadow: s.live ? "0 0 6px #4caf50" : "none",
-                    }}
-                  />
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{
-                      fontSize: 12, fontWeight: s.current ? 700 : 500,
-                      color: s.current ? "#5ba3f5" : "#ddd",
-                      overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                    }}>
-                      {s.label}{s.current ? " (this panel)" : ""}
-                    </div>
-                    {s.preview && (
-                      <div style={{
-                        fontSize: 10, color: "#9aa",
-                        overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                      }}>
-                        {s.preview}
-                      </div>
-                    )}
-                    <div style={{
-                      fontSize: 10, color: "#777",
-                      overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                    }}>
-                      {s.live ? "running" : relativeTime(s.mtime)} · {s.short_id}
-                      {/* Once the resume actually started, "will resume" is
-                          just wrong — s.current already says it's live here. */}
-                      {selected && !isRunning ? " · will resume" : ""}
-                    </div>
-                  </div>
-                  {/* Text content, not CSS — stays visible even if DialogButton's
-                      own focus/hover styling wins the background fight above. */}
-                  {selected && (
-                    <div
-                      aria-hidden
-                      style={{ fontSize: 14, color: "#5ba3f5", flexShrink: 0, lineHeight: 1 }}
-                    >
-                      ✓
-                    </div>
-                  )}
-                </DialogButton>
-              </PanelSectionRow>
-            );
-          })}
-          <PanelSectionRow>
-            <div style={{ fontSize: 10, color: "#666", lineHeight: 1.4 }}>
-              Green means a claude process is live in that directory — open those
-              from the Claude app. Pick any other one to resume it here, then hit
-              Resume Session.
-            </div>
-          </PanelSectionRow>
-        </PanelSection>
-      )}
 
       {/* ── Screen Preview ──────────────────────────────────────────────── */}
       <PanelSection title="Screen Preview">
