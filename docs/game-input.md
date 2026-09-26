@@ -5,6 +5,63 @@ for users who only use a controller, out of the box — no installs, no sudo.
 Tested 2026-09-26 on CachyOS + gamescope, Steam Controller (2026), Resident
 Evil 5 (appid 21690) under Proton.
 
+## How controller input reaches a game
+
+A game never talks to your physical controller. Every frame it polls a
+*virtual* gamepad for its state (which buttons are down, stick and trigger
+values). Steam Input owns that virtual pad: it reads the real devices, applies
+your per-game controller config (bindings, chords, action sets), and writes the
+result to the virtual pad, keyboard or mouse the game sees.
+
+So "sending the same signals as the physical controller" means **becoming a
+device Steam reads**. Steam then treats it like any controller and the game
+cannot tell the difference.
+
+```mermaid
+flowchart LR
+    subgraph sources["Input sources"]
+        SC["Physical Steam Controller<br/>(proprietary HID)"]
+        PAD["Other physical pads<br/>(Xbox, DualSense, …)"]
+        VP["decky-claude virtual pad<br/>(/dev/uinput, Xbox 360 IDs)"]
+        EMU["Emulated Steam Controller<br/>(/dev/uhid, needs root setup)"]
+    end
+
+    subgraph steam["Steam client"]
+        SI["Steam Input<br/>per-game config:<br/>bindings, chords, action sets"]
+        OSK["On-screen keyboard path<br/>ControllerKeyboardSetKeyState"]
+    end
+
+    subgraph out["What the game sees"]
+        VX["Steam virtual gamepad<br/>(XInput / SDL)"]
+        KB["Keyboard / mouse events"]
+    end
+
+    GAME["Game<br/>(native or Proton/Wine)"]
+
+    SC --> SI
+    PAD --> SI
+    VP -- "verified" --> SI
+    EMU -. "not built" .-> SI
+    SI --> VX
+    SI --> KB
+    OSK -- "verified" --> KB
+    VX --> GAME
+    KB --> GAME
+```
+
+- **Virtual pad (uinput):** Steam adopts it like a real Xbox pad and applies the
+  running game's config. No root: Steam's `60-steam-input.rules` grants the
+  logged-in user `/dev/uinput`.
+- **Emulated Steam Controller (uhid):** would appear to Steam as an actual
+  Steam Controller (trackpads, gyro, Steam button). Needs a one-time udev rule
+  for `/dev/uhid` and a reimplementation of its HID protocol, so only worth it
+  if a game rejects the Xbox pad.
+- **Keyboard path:** the same injection Steam's on-screen keyboard uses; keys
+  only, no gamepad buttons or mouse clicks.
+- Valve's Steamworks *Steam Input API* (`ISteamInput`) is the **game** side —
+  a game asking Steam which actions are active. It is not a way for outside
+  programs to send input, which is why the device route above is needed.
+
 ## Verified
 
 **Keyboard via Steam's own API (no tools, no root).**
