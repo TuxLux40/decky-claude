@@ -105,12 +105,13 @@ def _claude_md_block(skill_name: str | None, machine_md: str = "") -> str:
     skill_section = ""
     if skill_name:
         skill_section = f"""
-## Steam debugger skill — load it first
+## Steam debugger skill — preloaded, always active
 
-The user's `{skill_name}` skill is installed for this session
-(`.claude/skills/{skill_name}`). BLOCKING REQUIREMENT: invoke the
-`{skill_name}` skill via the Skill tool at the start of the session, before
-doing any Steam or game debugging work, and follow its instructions.
+The `{skill_name}` skill's SKILL.md is already part of your system prompt
+(the plugin injects it on every start and resume). Follow it for all Steam,
+Steam Input, gamescope, Proton and game work, and read its reference files
+as it directs before experimenting. It is also linked at
+`.claude/skills/{skill_name}`.
 """
     machine_section = f"\n{machine_md}\n" if machine_md else ""
     return f"""\
@@ -523,6 +524,11 @@ class Plugin:
         master_fd, slave_fd = pty.openpty()
 
         argv = [claude_bin, "--remote-control", "--mcp-config", mcp_config]
+        # The skill is this plugin's core; an instruction to load it proved
+        # ignorable, so its SKILL.md goes straight into the system prompt.
+        preload = self._write_skill_preload()
+        if preload:
+            argv += ["--append-system-prompt-file", preload]
         if resume_id:
             argv += ["--resume", resume_id]
             self._session_id = resume_id
@@ -1088,6 +1094,43 @@ class Plugin:
                     if os.path.isfile(os.path.join(path, "SKILL.md")):
                         return path
         return None
+
+    def _write_skill_preload(self) -> str | None:
+        """Compose SKILL.md (minus frontmatter) with absolute reference paths
+        into a file for --append-system-prompt-file; None if no skill."""
+        src = self._find_steam_debugger_skill()
+        if not src:
+            logger.error("steam-debugger skill not found in %s — session starts without it", _SKILL_BASES)
+            return None
+        src = os.path.realpath(src)
+        try:
+            with open(os.path.join(src, "SKILL.md")) as f:
+                body = f.read()
+        except OSError as exc:
+            logger.error("cannot read %s/SKILL.md: %s", src, exc)
+            return None
+        if body.startswith("---"):
+            end = body.find("\n---", 3)
+            if end != -1:
+                body = body[end + 4:].lstrip("\n")
+        text = (
+            "# steam-debugger skill (preloaded by decky-claude, always active)\n\n"
+            "This is the full SKILL.md of the steam-debugger skill, loaded "
+            "automatically for this session. Follow it for all Steam, Steam "
+            "Input, gamescope, Proton and game work. Its files live in "
+            f"`{src}/` — when it refers to `reference/<file>.md` or "
+            f"`scripts/...`, use `{src}/reference/<file>.md` / `{src}/scripts/...`.\n\n"
+            "---\n\n" + body
+        )
+        path = os.path.join(_plugin_setting_dir("DECKY_PLUGIN_RUNTIME_DIR", "data"), "skill-preload.md")
+        try:
+            with open(path, "w") as f:
+                f.write(text)
+        except OSError as exc:
+            logger.error("cannot write skill preload %s: %s", path, exc)
+            return None
+        logger.info("steam-debugger skill preloaded from %s", src)
+        return path
 
     def _setup_skill(self, working_dir: str) -> None:
         """Symlink the steam-debugger skill into the session's .claude/skills

@@ -1,171 +1,159 @@
-<img src="assets/glyph.png" alt="" width="96" height="96" align="right">
+<div align="center">
+
+<img src="assets/icon.png" alt="decky-claude" width="128" height="128">
 
 # decky-claude
 
-A [Decky Loader](https://decky.xyz/) plugin that starts a **Claude Code session on your Steam Deck that you control from your phone** — built first and foremost to debug **Steam and the Steam UI** without leaving Gaming Mode.
+**Claude Code on your Steam machine, controlled from your phone — built to debug Steam without leaving Gaming Mode.**
 
-Tap *Start Remote Session* in the Quick Access menu, open the session URL in the Claude app on your phone, and Claude is on your Deck: it can interrogate the Steam client from the inside, read logs, see your screen, and press buttons — while you watch from the couch.
+[![Latest release](https://img.shields.io/github/v/release/TuxLux40/decky-claude?label=release&color=5ba3f5)](https://github.com/TuxLux40/decky-claude/releases/latest)
+[![Build & Release](https://img.shields.io/github/actions/workflow/status/TuxLux40/decky-claude/release.yml?branch=main&label=build)](https://github.com/TuxLux40/decky-claude/actions/workflows/release.yml)
+[![Decky Loader](https://img.shields.io/badge/Decky-Loader-1a9fff)](https://decky.xyz/)
+[![License: MIT](https://img.shields.io/github/license/TuxLux40/decky-claude?color=lightgrey)](LICENSE)
+
+[Install](#installation) · [How it works](#how-it-works) · [Usage](#usage) · [Roadmap](#roadmap)
+
+</div>
 
 ---
 
-## Scope: Gaming Mode only
-
-This plugin targets **Gaming Mode — a gamescope session** and nothing else.
-Screen capture goes through `gamescopectl`, which is the same compositor-side
-capture the controller's screenshot button triggers: Steam sets the
-`GAMESCOPECTRL_REQUEST_SCREENSHOT` atom and gamescope takes the frame. Calling
-it directly just lets the frame land at a path we choose instead of in your
-Steam screenshot library.
-
-There is deliberately no desktop fallback. gamescope implements no Wayland
-screencopy protocol, so `grim` cannot capture there, and a desktop session
-would need a compositor-specific path of its own (KWin, for instance, exposes
-capture only over its own D-Bus interface). Supporting both means carrying a
-tool per desktop environment for a case this plugin is not for. Run Big Picture
-inside a desktop session and the session features still work — `screenshot`
-will simply report that it needs Gaming Mode.
+Tap **Start Remote Session** in the Quick Access menu, open the link in the Claude app on your phone, and Claude is on your machine: it inspects the Steam client from the inside, reads logs, looks at your screen and presses buttons — while you watch from the couch.
 
 ## What it does
 
-1. **Phone-controlled Claude Code** — the plugin launches `claude --remote-control` (remote control) in a working directory you pick and shows the `https://claude.ai/code/session_…` URL in the panel. Open it in the Claude app and drive the session from your phone.
-2. **Steam UI debugger (the main event)** — Steam's Gaming Mode UI is embedded Chromium (CEF) with its DevTools debugger on `localhost:8080` (Decky itself relies on it). Claude gets `steam_ui_eval`: it runs JavaScript inside Steam over the Chrome DevTools Protocol, inspects the `SteamClient` API, reads real client state (downloads, library, settings, login), and triggers real actions — no pixel-hunting.
-3. **Eyes and hands** — `screenshot` returns what's on screen as an image; `send_key` / `type_text` / `mouse_move_click` inject input via `xdotool`/`ydotool`. By default a capture is the game/desktop frame only — the same base-plane-only frame the physical screenshot button captures, with the Steam overlay (Quick Access Menu, notifications) excluded. Pass `include_steam_ui: true` (or flip the panel's toggle) to capture the overlay too.
-4. **steam-debugger skill, autoloaded** — a bundled Claude Code skill encodes the debugging workflow (interrogate Steam UI first, log locations, least-invasive-fix rules, safety rails), with per-topic reference files. It is pulled from [TuxLux40/skills](https://github.com/TuxLux40/skills) as a git submodule, so upstream skill updates land here via automated PRs. It is linked into every session and Claude is instructed to load it at session start. A personal copy in `~/.claude/skills/` (any folder named like *steam…debug…*) overrides the bundled one.
+| | |
+|---|---|
+| **Phone-controlled Claude Code** | The plugin starts `claude --remote-control` in a working directory you pick and shows the session link. Open it in the Claude app and drive the session from your phone. |
+| **Steam UI debugger** | Steam's Gaming Mode UI is embedded Chromium with a DevTools debugger on `localhost:8080`. Claude runs JavaScript inside it (`steam_ui_eval`), reads real client state — downloads, library, login, settings — and triggers real actions instead of hunting for pixels. |
+| **Eyes and hands** | `screenshot` shows Claude what's on screen; `send_key`, `type_text` and `mouse_move_click` press keys and click. |
+| **Always-loaded debugging skill** | The [steam-debugger skill](https://github.com/TuxLux40/skills) (workflow, log locations, safe-fix rules, per-topic references) is injected into every session's system prompt — on start and on resume. |
+| **Keeps itself up to date** | Checks GitHub for new releases and installs them through Decky's own installer. |
 
-In-game help (asking Claude about the game you're playing) works through the same screenshot/input tools, but it's a nice-to-have — the tooling is tuned for Steam debugging.
+In-game help (asking Claude about the game you're playing) uses the same tools; the tooling is tuned for Steam debugging.
+
+> [!NOTE]
+> **Gaming Mode only.** Screen capture goes through gamescope — the same capture the controller's screenshot button uses. There is deliberately no desktop fallback: gamescope has no Wayland screencopy protocol, and each desktop would need its own capture path. In Desktop Mode the session still works; `screenshot` and input just report that they need Gaming Mode.
 
 ## How it works
 
+```mermaid
+flowchart LR
+    phone["Claude app<br/>on your phone"]
+
+    subgraph machine["Steam machine — Gaming Mode"]
+        panel["Quick Access panel<br/>(React)"]
+        backend["main.py<br/>Decky backend"]
+        claude["claude --remote-control"]
+        mcp["mcp_server.py<br/>stdio MCP server"]
+        steam["Steam client<br/>CEF debugger :8080"]
+        gs["gamescope<br/>screenshots"]
+        input["keyboard / mouse<br/>input"]
+    end
+
+    phone <-- "claude.ai/code session" --> claude
+    panel --> backend
+    backend -- "starts, injects skill + config" --> claude
+    claude --> mcp
+    mcp -- "steam_ui_eval / steam_snippet" --> steam
+    mcp -- "screenshot" --> gs
+    mcp -- "send_key / type_text / click" --> input
 ```
-Your phone (Claude app)
-      │  claude.ai/code session (claude --remote-control)
-      ▼
-Steam Deck — Gaming Mode
-  ┌───────────────────────────────────────────┐
-  │ Decky Quick Access panel (React)          │
-  │   └─ main.py backend: spawns claude --remote-control, │
-  │      links skill, writes .mcp.json        │
-  │                                           │
-  │ claude --remote-control ──► mcp_server.py (stdio MCP) │
-  │                   ├─ steam_ui_eval ───────┼──► Steam CEF debugger :8080
-  │                   ├─ screenshot (gamescope) │    (Chrome DevTools Protocol)
-  │                   └─ send_key/type/click  │
-  │                      (xdotool/ydotool)    │
-  └───────────────────────────────────────────┘
-```
 
-Everything injected into the working directory (`.mcp.json`, the `CLAUDE.md` block, the skill symlink) is removed again when you stop the session. `mcp_server.py` is stdlib-only Python — no pip dependencies, no daemon, no open ports; it lives only as a child of the Claude session.
+Everything written into the working directory (`.mcp.json`, the `CLAUDE.md` block, the skill link) is removed when the session stops. `mcp_server.py` is stdlib-only Python: no pip dependencies, no daemon, no open ports — it only lives as a child of the Claude session.
 
-## How game input works (planned feature)
-
-A game never reads your physical controller directly. Steam creates a
-**virtual gamepad** for each connected controller, fills it with your button
-presses after applying your per-game controller config, and the game polls
-that virtual pad every frame.
-
-So for Claude to press buttons "as your controller", it doesn't need to fake
-your controller or talk to Steam through some API — it writes button events
-straight into Steam's virtual gamepad for your controller. The game can't tell
-them apart from your own presses, and no second controller or player-2 slot
-appears. Steam's own udev rules already allow this without root.
-
-Common misconceptions this clears up: Valve's *Steam Input API* is for games
-(a game asking Steam which actions are pressed), not for outside programs to
-send input; and creating a new virtual controller makes Steam see an *extra*
-controller rather than yours. Details, diagram and test results:
-[`docs/game-input.md`](docs/game-input.md).
-
-## MCP tools
+### MCP tools
 
 | Tool | Purpose |
 |---|---|
-| `steam_snippet` | Run a curated, pre-verified SteamClient query (downloads, login, library, running, client info, refresh, updates) |
+| `steam_snippet` | Curated, pre-verified SteamClient queries: downloads, login, library, running apps, client info, library refresh, update check |
 | `steam_ui_targets` | List Steam's live UI pages (CDP targets) |
-| `steam_ui_eval` | Run JavaScript inside the Steam client (`SharedJSContext` = `SteamClient` API) |
-| `screenshot` | Capture the display, returned as a PNG image. Game/desktop frame only by default; `include_steam_ui: true` also captures the Steam overlay (QAM, notifications) — unverified on hardware |
-| `send_key` | Key press to the focused window |
-| `type_text` | Type a string |
-| `mouse_move_click` | Move to (x, y) and click (1280×800 native) |
-| `session_context` | Live "where am I running" check (read-only, see below) |
+| `steam_ui_eval` | Run JavaScript inside the Steam client (`SharedJSContext` hosts the `SteamClient` API) |
+| `screenshot` | Capture the display as a PNG |
+| `send_key` / `type_text` | Key press / type a string into the focused window |
+| `mouse_move_click` | Move to (x, y) and click |
+| `session_context` | Live check: Gaming or Desktop Mode, and whether the session runs inside the plugin |
 
-### `session_context`: where is this session running?
+<details>
+<summary><b><code>session_context</code> — why it exists</b></summary>
 
 Two facts change what Claude can safely do, and both can change mid-session:
 
-- **Display mode.** `gaming` if a `gamescope` / `gamescope-wl` process is running for the user, `desktop` otherwise. The process is the deciding signal; the `gamescope-N` socket is only reported as evidence, since a socket can outlive its compositor. `screenshot` and the input tools work only in `gaming`; in Desktop Mode use `steam_ui_eval` / `steam_snippet`.
-- **Session origin.** Whether the Claude process descends from Decky's `PluginLoader` (walked via `/proc/<pid>/stat`, with the systemd unit from `/proc/<pid>/cgroup` as a fallback). A session launched from the plugin **dies instantly when `plugin_loader.service` restarts and does not auto-resume**. A standalone terminal session that uses the same MCP server is unaffected.
+- **Display mode.** `gaming` if a `gamescope` / `gamescope-wl` process is running for the user, otherwise `desktop`. Screenshots and input only work in `gaming`; in Desktop Mode Claude uses `steam_ui_eval` / `steam_snippet`.
+- **Session origin.** Whether the Claude process descends from Decky's `PluginLoader`. A session started from the plugin **ends instantly when `plugin_loader.service` restarts and does not resume on its own**; a standalone terminal session using the same tools is unaffected.
 
-The tool returns JSON with the evidence (gamescope/desktop PIDs, runtime sockets, the ancestor chain, the systemd unit) plus a one-line consequence for each fact. The injected `CLAUDE.md` block tells Claude to call it before using screenshots or input, and before restarting the loader. The machine profile's mode line is marked as a snapshot from session start. When screenshots or input fail in Desktop Mode, the error message also points to this tool.
+The tool returns the evidence (processes, sockets, the process ancestry, the systemd unit) plus a one-line consequence for each fact. Claude is told to call it before screenshots, input, or restarting the loader.
+
+</details>
+
+<details>
+<summary><b>How game input works</b> (planned feature)</summary>
+
+A game never reads your physical controller directly. Steam creates a **virtual gamepad** for each connected controller, fills it with your presses after applying your per-game controller config, and the game polls that virtual pad every frame.
+
+So for Claude to press buttons *as your controller*, it doesn't fake your controller or call some Steam API — it writes button events straight into Steam's virtual gamepad for your controller. The game can't tell them apart from your own presses, no second controller or player-2 slot appears, and Steam's own udev rules already allow it without root.
+
+This also clears up two common misconceptions: Valve's *Steam Input API* is for games (a game asking Steam which actions are pressed), not for outside programs to send input; and creating a new virtual controller makes Steam see an *extra* controller rather than yours. Details, diagram and test results: [`docs/game-input.md`](docs/game-input.md).
+
+</details>
 
 ## Installation
 
-### Prerequisites (Desktop Mode, one-time)
+> [!IMPORTANT]
+> Needs [Decky Loader](https://decky.xyz/) and [Claude Code](https://docs.claude.com/en/docs/claude-code) installed and logged in.
+
+**1. Install Claude Code** (Desktop Mode, once):
 
 ```bash
-# Install and log in to Claude Code
 npm install -g @anthropic-ai/claude-code
-claude
+claude   # log in
+```
 
-# gamescopectl ships with gamescope
-which gamescopectl
+**2. Install the plugin** — through Decky, no terminal needed:
 
-# send_key/type_text/mouse_move_click need xdotool (primary) and ydotool
-# (fallback for pure-Wayland sessions with no XWayland). Neither ships by
-# default and the plugin backend runs unprivileged, so this can't be done
-# for you automatically — run it once yourself:
+1. Decky → Settings → **General** → enable **Developer mode**.
+2. Decky → Settings → **Developer** → **Install Plugin from URL**:
+   ```
+   https://github.com/TuxLux40/decky-claude/releases/latest/download/decky-claude.zip
+   ```
+
+The plugin isn't in the Decky store, so it won't show up in the in-app store listing.
+
+<details>
+<summary><b>Keyboard and mouse input tools</b> (optional, for <code>send_key</code> / <code>type_text</code> / <code>mouse_move_click</code>)</summary>
+
+These use `xdotool` (primary) and `ydotool` (fallback for pure-Wayland sessions). Neither ships by default, so run once in Desktop Mode:
+
+```bash
 ./scripts/setup-input-tools.sh
 ```
 
-Decky Loader must be installed — it also keeps Steam's CEF debugger enabled, which `steam_ui_eval` needs.
+A dependency-free replacement that injects input through Steam's own virtual controller is being researched — see [How game input works](docs/game-input.md) and [#16](https://github.com/TuxLux40/decky-claude/pull/16).
 
-> Not on SteamOS? That works too. The plugin resolves the desktop user from
-> `DECKY_USER_HOME` / `DECKY_USER` (falling back to the account the backend runs
-> as), so it does not assume a `deck` user or uid 1000.
+</details>
 
-### From a release
+<details>
+<summary><b>Updates</b></summary>
 
-Every change merged to `main` is built by CI and published as a
-[GitHub release][releases] (`decky-claude.zip`, plus its sha256). Install it
-through Decky itself — no terminal needed:
+Decky only offers updates for store plugins, so decky-claude checks for them itself. It asks GitHub for the latest release (at most every 6 hours) and shows the installed and latest version under **Plugin Updates** at the bottom of the panel.
 
-1. Decky → Settings → **General** → enable **Developer mode**.
-2. Decky → Settings → **Developer** → **Install Plugin from URL** and enter
-   `https://github.com/TuxLux40/decky-claude/releases/latest/download/decky-claude.zip`
-   (or download the zip and use **Install Plugin from ZIP File**).
+- **Install vX** hands the release to Decky's own installer — Decky asks for confirmation, verifies the zip's sha256 and reloads the plugin.
+- **Auto-update** (on by default) does this by itself. It never runs while a remote session is active, because reloading the plugin would end it.
 
-Manual alternative: extract the zip into `~/homebrew/plugins/` and run
-`sudo systemctl restart plugin_loader`.
+Every change merged to `main` is built by CI and published as a [release](https://github.com/TuxLux40/decky-claude/releases) (`v1.0.1`, `v1.0.2`, …). Settings survive updates.
 
-This plugin is distributed here rather than through the official Decky store, so it will not appear in the in-app store listing — install it from a release or from source.
+</details>
 
-[releases]: https://github.com/TuxLux40/decky-claude/releases
+<details>
+<summary><b>Other platforms</b></summary>
 
-### Updates
+Not on SteamOS? That works too. The plugin resolves the desktop user from `DECKY_USER_HOME` / `DECKY_USER` (falling back to the account the backend runs as), so it doesn't assume a `deck` user or uid 1000.
 
-Because the plugin is not in the Decky store, Decky itself never offers updates
-for it — the plugin checks for them instead. It asks GitHub for the latest
-release (at most every 6 hours; offline or rate-limited checks just retry
-later) and shows the installed and latest version under **Plugin Updates** at
-the bottom of the panel.
+</details>
 
-- **Install vX** hands the release to Decky's own plugin installer — the same
-  path the Decky store uses — so you get Decky's usual confirmation prompt, the
-  zip's sha256 is verified, and the plugin reloads in place.
-- **Auto-update** (on by default) does that by itself shortly after Steam starts
-  and periodically afterwards. You still confirm Decky's prompt; if you cancel
-  it you are not asked again for that version until Steam restarts. It never
-  triggers while a remote session is running, since reloading the plugin would
-  end it.
+<details>
+<summary><b>From source</b></summary>
 
-Release versions are patch bumps of the previous tag (`v1.0.1`, `v1.0.2`, …).
-For a minor/major bump, commit the new version to `package.json`; CI uses
-whichever is higher. Settings survive updates (they live in Decky's per-plugin
-settings directory, not the plugin folder).
-
-### From source
-
-The bundled skill is a git submodule, so clone recursively (or run
-`git submodule update --init` in an existing checkout):
+The bundled skill is a git submodule, so clone recursively:
 
 ```bash
 git clone --recursive https://github.com/TuxLux40/decky-claude.git
@@ -174,56 +162,71 @@ pnpm install
 pnpm build
 ```
 
-Copy the plugin folder (containing `dist/`, `skills/`, `main.py`, `mcp_server.py`, `deck_common.py`, `machine_profile.py`, `plugin.json`, `package.json`) to `~/homebrew/plugins/decky-claude/` and restart Decky Loader. `skills/steam-debugger` is a symlink into the
-submodule — copy with `cp -rL` (or equivalent) so the real files land in the
-plugin folder.
+Copy `dist/`, `skills/`, `main.py`, `mcp_server.py`, `deck_common.py`, `machine_profile.py`, `plugin.json` and `package.json` to `~/homebrew/plugins/decky-claude/` and restart Decky Loader. Copy `skills/` with `cp -rL` — it's a symlink into the submodule. Don't symlink the plugin folder itself to a checkout: Decky changes ownership of whatever it points to.
+
+</details>
 
 ## Usage
 
-1. In Gaming Mode: open Quick Access (⋯) and pick the **Claude** icon in the
-   sidebar — or go through the Decky tab → **Claude Code**. The sidebar icon can
-   be turned off with **Settings → Show in Quick Access sidebar** at the bottom
-   of the panel (on by default; applies the next time Quick Access opens).
-   Decky has no public API for sidebar tabs, so this uses Decky Loader
-   internals: if a Decky update breaks them, the toggle shows as unavailable
-   and the plugin stays reachable through the Decky tab.
-2. Leave **Session** on *New session* and pick a working directory, or choose a
-   past session to pick up where it left off — resuming replays the transcript
-   in the directory it was recorded in, so the working directory follows from
-   the session. Then tap **Start Remote Session** / **Resume Session**.
-3. Open the shown URL in the Claude app on your phone.
-4. Describe the problem ("downloads are stuck", "Steam won't stay logged in", "X crashes at the menu"). Claude loads the steam-debugger skill, inspects Steam from the inside, reads logs, screenshots the screen, and walks the fix with you.
-5. Stop the session from the panel when done — all injected config is cleaned up.
+1. In Gaming Mode, open Quick Access (**⋯**) and pick the **Claude** icon in the sidebar — or Decky tab → **Claude Code**.
+2. Leave **Session** on *New session* and pick a working directory, or choose a past session to continue it. Tap **Start Remote Session** / **Resume Session**.
+3. Open the shown link in the Claude app on your phone.
+4. Describe the problem — *"downloads are stuck"*, *"Steam won't stay logged in"*, *"the game crashes at the menu"*. Claude inspects Steam from the inside, reads logs, looks at the screen and walks you through the fix.
+5. Stop the session from the panel when you're done; everything it set up is cleaned away.
 
-Screenshots happen in the chat: Claude captures on its own via the `screenshot` MCP tool whenever it needs to see something. The panel's collapsible **Manual Input** section offers key/mouse/text input for when you want to poke the machine yourself.
-
-## Repository layout
-
-| Path | What |
-|---|---|
-| `main.py` | Decky backend: session lifecycle, working-dir setup/cleanup, panel API |
-| `mcp_server.py` | Stdlib-only stdio MCP server: CDP client + screenshot + input tools |
-| `machine_profile.py` | Probes hardware/OS/session/Steam into the session's CLAUDE.md; run standalone to inspect |
-| `deck_common.py` | Display environment and xdotool/ydotool commands shared by both |
-| `src/index.tsx` | Quick Access panel (React, built to `dist/` by rollup) |
-| `src/sidebarTab.tsx` | Optional dedicated Quick Access sidebar tab (Decky internals, isolated) |
-| `src/update.tsx` | Update check / auto-update UI, installs via Decky's installer |
-| `skills/steam-debugger` | Symlink to `vendor/skills/skills/steam-debugger` — the bundled Claude Code skill, autoloaded into sessions (dereferenced into real files at packaging time) |
-| `vendor/skills/` | Git submodule: [TuxLux40/skills](https://github.com/TuxLux40/skills), source of truth for the skill |
-| `.github/dependabot.yml` | Daily submodule bumps (skill updates) + weekly GitHub Actions bumps |
-| `assets/` | Plugin icon (D-pad + Claude spark) as SVG source and PNG |
-| `.github/workflows/release.yml` | Builds `decky-claude.zip` and publishes a release on every push to `main` |
+> [!TIP]
+> The sidebar icon can be turned off under **Settings → Show in Quick Access sidebar** at the bottom of the panel. It relies on Decky internals; if a Decky update breaks them, the toggle shows as unavailable and the plugin stays reachable through the Decky tab.
 
 ## Roadmap
 
+**Done**
+
 - [x] Phone-controlled `claude --remote-control` sessions from the Quick Access menu
-- [x] Steam UI debugging via Chrome DevTools Protocol (`steam_ui_eval`)
-- [x] Screenshot + keyboard/mouse/text MCP tools
-- [x] Bundled steam-debugger skill, autoloaded (personal copy overrides)
-- [x] Resume a past session from the panel, and see what else is running here
-- [x] Curated `SteamClient` helper snippets (stuck downloads, login state, library refresh)
-- [ ] Log file watcher (tail Steam logs into Claude's context)
-- [ ] In-game assistance polish (game detection, per-game context) — later
+- [x] Steam UI debugging via Chrome DevTools Protocol (`steam_ui_eval`) and curated `steam_snippet` queries
+- [x] Screenshot and keyboard/mouse/text tools
+- [x] steam-debugger skill from the [skills repo](https://github.com/TuxLux40/skills), always loaded into every session
+- [x] Resume past sessions from a compact dropdown ([#8](https://github.com/TuxLux40/decky-claude/issues/8))
+- [x] Own icon in the Quick Access sidebar (optional)
+- [x] Self-updating releases through Decky's installer
+- [x] `session_context`: live Gaming/Desktop Mode and session-origin check
+
+**In progress**
+
+- [ ] **Game input through Steam's virtual controller** — press buttons on your own controller's slot, no extra tools or root ([#16](https://github.com/TuxLux40/decky-claude/pull/16), [how it works](docs/game-input.md))
+
+**Planned**
+
+- [ ] Model and effort selection in the panel ([#9](https://github.com/TuxLux40/decky-claude/issues/9))
+- [ ] Live log watcher for in-game performance troubleshooting ([#7](https://github.com/TuxLux40/decky-claude/issues/7))
+- [ ] Guide + setup script for sudo via YubiKey in Gaming Mode ([#5](https://github.com/TuxLux40/decky-claude/issues/5))
+- [ ] Self-improvement loop: memories and skills that grow from your sessions, made for Gaming Mode users ([#6](https://github.com/TuxLux40/decky-claude/issues/6))
+
+**Ideas**
+
+- [ ] VL-JEPA perception sidecar for watching live gameplay ([#10](https://github.com/TuxLux40/decky-claude/issues/10))
+
+## Repository layout
+
+<details>
+<summary>Files and what they do</summary>
+
+| Path | What |
+|---|---|
+| `main.py` | Decky backend: session lifecycle, skill preload, working-dir setup/cleanup, updates, panel API |
+| `mcp_server.py` | Stdlib-only stdio MCP server: CDP client, screenshot, input, `session_context` |
+| `machine_profile.py` | Probes hardware/OS/session/Steam into the session's CLAUDE.md; run standalone to inspect |
+| `deck_common.py` | Display environment and xdotool/ydotool commands shared by both |
+| `src/index.tsx` | Quick Access panel (React, built to `dist/` by rollup) |
+| `src/sidebarTab.tsx` | Optional Quick Access sidebar tab (Decky internals, isolated) |
+| `src/update.tsx` | Update check / auto-update UI |
+| `skills/steam-debugger` | Symlink into the skills submodule (real files at packaging time) |
+| `vendor/skills/` | Git submodule: [TuxLux40/skills](https://github.com/TuxLux40/skills) |
+| `assets/` | Plugin icon (SVG source and PNG) |
+| `.github/workflows/release.yml` | Builds `decky-claude.zip` and publishes a release on every push to `main` |
+| `.github/dependabot.yml` | Daily skill-submodule bumps, weekly GitHub Actions bumps |
+| `CLAUDE.md` | Rules for anyone (human or agent) changing this repo |
+
+</details>
 
 ## License
 
