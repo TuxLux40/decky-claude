@@ -11,6 +11,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - uses: actions/setup-node@v4
         with:
@@ -30,7 +32,11 @@ jobs:
       - name: Package plugin
         run: |
           mkdir -p out/decky-claude
-          cp -r dist skills plugin.json package.json main.py mcp_server.py deck_common.py machine_profile.py LICENSE README.md out/decky-claude/
+          cp -r dist plugin.json package.json main.py mcp_server.py deck_common.py machine_profile.py LICENSE README.md out/decky-claude/
+          # skills/steam-debugger is a symlink into the vendor/skills submodule;
+          # -L dereferences it so the zip ships real files.
+          cp -rL skills out/decky-claude/
+          test -f out/decky-claude/skills/steam-debugger/SKILL.md
           # Sourcemaps are ~70x the bundle size and unused at runtime.
           rm -f out/decky-claude/dist/*.map
           cd out

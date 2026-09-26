@@ -30,7 +30,7 @@ will simply report that it needs Gaming Mode.
 1. **Phone-controlled Claude Code** — the plugin launches `claude --remote-control` (remote control) in a working directory you pick and shows the `https://claude.ai/code/session_…` URL in the panel. Open it in the Claude app and drive the session from your phone.
 2. **Steam UI debugger (the main event)** — Steam's Gaming Mode UI is embedded Chromium (CEF) with its DevTools debugger on `localhost:8080` (Decky itself relies on it). Claude gets `steam_ui_eval`: it runs JavaScript inside Steam over the Chrome DevTools Protocol, inspects the `SteamClient` API, reads real client state (downloads, library, settings, login), and triggers real actions — no pixel-hunting.
 3. **Eyes and hands** — `screenshot` returns what's on screen as an image; `send_key` / `type_text` / `mouse_move_click` inject input via `xdotool`/`ydotool`. By default a capture is the game/desktop frame only — the same base-plane-only frame the physical screenshot button captures, with the Steam overlay (Quick Access Menu, notifications) excluded. Pass `include_steam_ui: true` (or flip the panel's toggle) to capture the overlay too.
-4. **steam-debugger skill, autoloaded** — a bundled Claude Code skill encodes the debugging workflow (interrogate Steam UI first, log locations, least-invasive-fix rules, safety rails). It is linked into every session and Claude is instructed to load it at session start. A personal copy in `~/.claude/skills/` (any folder named like *steam…debug…*) overrides the bundled one.
+4. **steam-debugger skill, autoloaded** — a bundled Claude Code skill encodes the debugging workflow (interrogate Steam UI first, log locations, least-invasive-fix rules, safety rails), with per-topic reference files. It is pulled from [TuxLux40/skills](https://github.com/TuxLux40/skills) as a git submodule, so upstream skill updates land here via automated PRs. It is linked into every session and Claude is instructed to load it at session start. A personal copy in `~/.claude/skills/` (any folder named like *steam…debug…*) overrides the bundled one.
 
 In-game help (asking Claude about the game you're playing) works through the same screenshot/input tools, but it's a nice-to-have — the tooling is tuned for Steam debugging.
 
@@ -107,12 +107,19 @@ This plugin is distributed here rather than through the official Decky store, so
 
 ### From source
 
+The bundled skill is a git submodule, so clone recursively (or run
+`git submodule update --init` in an existing checkout):
+
 ```bash
+git clone --recursive https://github.com/TuxLux40/decky-claude.git
+cd decky-claude
 pnpm install
 pnpm build
 ```
 
-Copy the plugin folder (containing `dist/`, `skills/`, `main.py`, `mcp_server.py`, `deck_common.py`, `machine_profile.py`, `plugin.json`, `package.json`) to `~/homebrew/plugins/decky-claude/` and restart Decky Loader.
+Copy the plugin folder (containing `dist/`, `skills/`, `main.py`, `mcp_server.py`, `deck_common.py`, `machine_profile.py`, `plugin.json`, `package.json`) to `~/homebrew/plugins/decky-claude/` and restart Decky Loader. `skills/steam-debugger` is a symlink into the
+submodule — copy with `cp -rL` (or equivalent) so the real files land in the
+plugin folder.
 
 ## Usage
 
@@ -136,7 +143,9 @@ The panel's **Screen Preview** section is for you, not Claude — Claude capture
 | `machine_profile.py` | Probes hardware/OS/session/Steam into the session's CLAUDE.md; run standalone to inspect |
 | `deck_common.py` | Display environment and xdotool/ydotool commands shared by both |
 | `src/index.tsx` | Quick Access panel (React, built to `dist/` by rollup) |
-| `skills/steam-debugger/` | Bundled Claude Code skill, autoloaded into sessions |
+| `skills/steam-debugger` | Symlink to `vendor/skills/skills/steam-debugger` — the bundled Claude Code skill, autoloaded into sessions (dereferenced into real files at packaging time) |
+| `vendor/skills/` | Git submodule: [TuxLux40/skills](https://github.com/TuxLux40/skills), source of truth for the skill |
+| `.github/dependabot.yml` | Daily submodule bumps (skill updates) + weekly GitHub Actions bumps |
 | `.github/workflows/release.yml` | Builds and packages `decky-claude.zip` on `v*` tags |
 | `assets/` | Plugin icon (D-pad + Claude spark) as SVG source and PNG |
 
