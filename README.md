@@ -105,15 +105,43 @@ Decky Loader must be installed — it also keeps Steam's CEF debugger enabled, w
 
 ### From a release
 
-Download `decky-claude.zip` from the [GitHub releases][releases] (built by CI on every `v*` tag) and extract it to `~/homebrew/plugins/`, then restart Decky Loader:
+Every change merged to `main` is built by CI and published as a
+[GitHub release][releases] (`decky-claude.zip`, plus its sha256). Install it
+through Decky itself — no terminal needed:
 
-```bash
-systemctl restart plugin_loader
-```
+1. Decky → Settings → **General** → enable **Developer mode**.
+2. Decky → Settings → **Developer** → **Install Plugin from URL** and enter
+   `https://github.com/TuxLux40/decky-claude/releases/latest/download/decky-claude.zip`
+   (or download the zip and use **Install Plugin from ZIP File**).
+
+Manual alternative: extract the zip into `~/homebrew/plugins/` and run
+`sudo systemctl restart plugin_loader`.
 
 This plugin is distributed here rather than through the official Decky store, so it will not appear in the in-app store listing — install it from a release or from source.
 
 [releases]: https://github.com/TuxLux40/decky-claude/releases
+
+### Updates
+
+Because the plugin is not in the Decky store, Decky itself never offers updates
+for it — the plugin checks for them instead. It asks GitHub for the latest
+release (at most every 6 hours; offline or rate-limited checks just retry
+later) and shows the installed and latest version under **Plugin Updates** at
+the bottom of the panel.
+
+- **Install vX** hands the release to Decky's own plugin installer — the same
+  path the Decky store uses — so you get Decky's usual confirmation prompt, the
+  zip's sha256 is verified, and the plugin reloads in place.
+- **Auto-update** (on by default) does that by itself shortly after Steam starts
+  and periodically afterwards. You still confirm Decky's prompt; if you cancel
+  it you are not asked again for that version until Steam restarts. It never
+  triggers while a remote session is running, since reloading the plugin would
+  end it.
+
+Release versions are patch bumps of the previous tag (`v1.0.1`, `v1.0.2`, …).
+For a minor/major bump, commit the new version to `package.json`; CI uses
+whichever is higher. Settings survive updates (they live in Decky's per-plugin
+settings directory, not the plugin folder).
 
 ### From source
 
@@ -160,11 +188,12 @@ The panel's **Screen Preview** section is for you, not Claude — Claude capture
 | `deck_common.py` | Display environment and xdotool/ydotool commands shared by both |
 | `src/index.tsx` | Quick Access panel (React, built to `dist/` by rollup) |
 | `src/sidebarTab.tsx` | Optional dedicated Quick Access sidebar tab (Decky internals, isolated) |
+| `src/update.tsx` | Update check / auto-update UI, installs via Decky's installer |
 | `skills/steam-debugger` | Symlink to `vendor/skills/skills/steam-debugger` — the bundled Claude Code skill, autoloaded into sessions (dereferenced into real files at packaging time) |
 | `vendor/skills/` | Git submodule: [TuxLux40/skills](https://github.com/TuxLux40/skills), source of truth for the skill |
 | `.github/dependabot.yml` | Daily submodule bumps (skill updates) + weekly GitHub Actions bumps |
-| `.github/workflows/release.yml` | Builds and packages `decky-claude.zip` on `v*` tags |
 | `assets/` | Plugin icon (D-pad + Claude spark) as SVG source and PNG |
+| `.github/workflows/release.yml` | Builds `decky-claude.zip` and publishes a release on every push to `main` |
 
 ## Roadmap
 

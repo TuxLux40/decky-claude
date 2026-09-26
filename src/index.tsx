@@ -14,6 +14,7 @@ import { useEffect, useMemo, useState } from "react";
 import { FaTerminal } from "react-icons/fa";
 import qrcode from "qrcode-generator";
 import { disposeSidebarTab, initSidebarTab, SidebarTabToggle } from "./sidebarTab";
+import { startAutoUpdate, UpdateSection } from "./update";
 
 // ── backend callables ──────────────────────────────────────────────────────────
 
@@ -864,6 +865,8 @@ function Content() {
           <SidebarTabToggle />
         </PanelSectionRow>
       </PanelSection>
+      {/* ── Plugin Updates (see update.tsx) ─────────────────────────────── */}
+      <UpdateSection />
     </>
   );
 }
@@ -872,6 +875,7 @@ function Content() {
 
 export default definePlugin(() => {
   initSidebarTab(<Content />);
+  const stopAutoUpdate = startAutoUpdate();
   return {
     name: "Claude Code",
     title: <div className={staticClasses.Title}>Claude Code</div>,
@@ -879,6 +883,7 @@ export default definePlugin(() => {
     content: <Content />,
     onDismount() {
       disposeSidebarTab();
+      stopAutoUpdate();
     },
   };
 });

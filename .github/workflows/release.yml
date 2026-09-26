@@ -1,10 +1,30 @@
 name: Build & Release
 
+# Every push to main becomes a release; installed copies pick it up through the
+# plugin's self-updater (GitHub "latest release" -> Decky's installer).
+#
+# Versioning: next = max(latest v* tag with patch+1, version in package.json).
+# So routine merges get a patch bump automatically, and a minor/major bump is
+# done by committing the new version to package.json (e.g. 1.1.0). The bump is
+# stamped into the build only; nothing is committed back to main, and tags
+# created with GITHUB_TOKEN don't trigger workflows, so there is no loop.
+# Pushing a v* tag by hand releases exactly that version.
+
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
   workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Serialise releases so two quick merges can't compute the same version.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -13,6 +33,52 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 0
+
+      - name: Compute version
+        id: version
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            skip=false
+          else
+            # Already released this exact commit (e.g. re-run / manual dispatch)?
+            existing="$(git tag --points-at HEAD --list 'v[0-9]*.[0-9]*.[0-9]*' | head -n1)"
+            if [[ -n "$existing" ]]; then
+              version="${existing#v}"
+              skip=true
+            else
+              latest="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)"
+              latest="${latest#v}"
+              if [[ -z "$latest" ]]; then
+                bumped="1.0.1"
+              else
+                IFS=. read -r major minor patch <<< "${latest%%-*}"
+                bumped="${major}.${minor}.$((patch + 1))"
+              fi
+              base="$(jq -r .version package.json)"
+              # Take whichever is higher, so committed minor/major bumps win.
+              version="$(printf '%s\n%s\n' "$bumped" "$base" | sort -V | tail -n1)"
+              skip=false
+            fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+          echo "Version: $version (skip release: $skip)"
+
+      - name: Stamp version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          for f in package.json plugin.json; do
+            jq --arg v "$VERSION" '.version = $v' "$f" > "$f.tmp"
+            mv "$f.tmp" "$f"
+          done
+          grep '"version"' package.json plugin.json
 
       - uses: actions/setup-node@v4
         with:
@@ -30,6 +96,7 @@ jobs:
         run: pnpm build
 
       - name: Package plugin
+        id: package
         run: |
           mkdir -p out/decky-claude
           cp -r dist plugin.json package.json main.py mcp_server.py deck_common.py machine_profile.py LICENSE README.md out/decky-claude/
@@ -41,16 +108,38 @@ jobs:
           rm -f out/decky-claude/dist/*.map
           cd out
           zip -r decky-claude.zip decky-claude/
+          # Decky's installer verifies the zip's sha256 before extracting.
+          sha256sum decky-claude.zip > decky-claude.zip.sha256
+          echo "sha256=$(cut -d' ' -f1 decky-claude.zip.sha256)" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: decky-claude
-          path: out/decky-claude.zip
+          path: |
+            out/decky-claude.zip
+            out/decky-claude.zip.sha256
 
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: out/decky-claude.zip
-          generate_release_notes: true
+        if: steps.version.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          SHA256: ${{ steps.package.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          notes="$(mktemp)"
+          {
+            echo "Install: download \`decky-claude.zip\` and use Decky → Settings → Developer → Install Plugin from ZIP, or let an existing install update itself."
+            echo
+            echo "\`decky-claude.zip\` sha256: \`$SHA256\`"
+          } > "$notes"
+          # Creates the tag at this commit (unless it was pushed by hand) and
+          # marks the release as latest, which is what the updater reads.
+          gh release create "$TAG" \
+            out/decky-claude.zip out/decky-claude.zip.sha256 \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes-file "$notes" \
+            --generate-notes \
+            --latest
