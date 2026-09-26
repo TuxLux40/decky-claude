@@ -648,19 +648,27 @@ function Content() {
       {/* ── Sessions on this machine ───────────────────────────────────── */}
       {machineSessions.length > 0 && (
         <PanelSection title="Sessions on this device">
-          {/* DialogButton applies its own background/border via focus/hover
-              CSS that otherwise beats the inline style below — that CSS wins
-              specifically while a row has D-pad focus, i.e. exactly while the
-              user is looking at it to judge what's selected. The doubled
-              class raises specificity above a single-class selector, and the
-              :hover/:focus variants make sure the selected look survives
-              those states rather than just the resting one. */}
+          {/* Steam marks D-pad focus with a .gpfocus class (not :focus), and an
+              inline background would silently beat it — so all row colours
+              live here, and focus is declared last so it wins over selected. */}
           <style>{`
-            .decky-claude-session-row.decky-claude-session-row[data-selected="true"],
-            .decky-claude-session-row.decky-claude-session-row[data-selected="true"]:hover,
-            .decky-claude-session-row.decky-claude-session-row[data-selected="true"]:focus {
-              background-color: rgba(91,163,245,0.22) !important;
+            button.DialogButton.decky-claude-session-row {
+              background: rgba(255,255,255,0.04) !important;
+              border: 1px solid transparent !important;
+            }
+            button.DialogButton.decky-claude-session-row[data-selected="true"] {
+              background: rgba(91,163,245,0.22) !important;
               border-color: rgba(91,163,245,0.85) !important;
+            }
+            button.DialogButton.decky-claude-session-row.gpfocus,
+            button.DialogButton.decky-claude-session-row:hover {
+              background: rgb(70,77,88) !important;
+              border-color: rgba(255,255,255,0.9) !important;
+            }
+            button.DialogButton.decky-claude-session-row.gpfocus[data-selected="true"],
+            button.DialogButton.decky-claude-session-row[data-selected="true"]:hover {
+              background: rgba(91,163,245,0.45) !important;
+              border-color: #fff !important;
             }
           `}</style>
           {machineSessions.map((s) => {
@@ -678,10 +686,6 @@ function Content() {
                   style={{
                     width: "100%", minWidth: 0, padding: "6px 8px",
                     textAlign: "left", display: "flex", alignItems: "center", gap: 8,
-                    background: selected ? "rgba(91,163,245,0.18)" : "rgba(255,255,255,0.04)",
-                    border: selected
-                      ? "1px solid rgba(91,163,245,0.6)"
-                      : "1px solid transparent",
                   }}
                 >
                   <div
