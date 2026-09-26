@@ -419,6 +419,14 @@ def _get_updater() -> _Updater:
 # ── end self-update ────────────────────────────────────────────────────────────
 
 
+def _is_plugin_skill_link(path: str) -> bool:
+    """True if path is a symlink into this plugin's bundled skills."""
+    if not os.path.islink(path):
+        return False
+    target = os.path.abspath(os.path.join(os.path.dirname(path), os.readlink(path)))
+    return target.startswith(os.path.join(_PLUGIN_DIR, "skills") + os.sep)
+
+
 class Plugin:
     # ── session state ──────────────────────────────────────────────────────────
     _process: asyncio.subprocess.Process | None = None
@@ -1096,10 +1104,10 @@ class Plugin:
         dest = os.path.join(working_dir, ".claude", "skills", name)
         if os.path.realpath(dest) == os.path.realpath(src):
             self._skill_name = name
-            if os.path.islink(dest):
-                # Symlink from a previous session — track it for cleanup
+            # Adopt a leftover link only if we made it. In $HOME, dest is the
+            # user's own ~/.claude/skills override — cleanup must not delete it.
+            if _is_plugin_skill_link(dest):
                 self._skill_link_created = dest
-            # else: working dir already contains the real skill (e.g. /home/deck)
             return
 
         try:
@@ -1133,7 +1141,7 @@ class Plugin:
                 pass
 
         # Remove the skill symlink we created (never the user's real skill)
-        if self._skill_link_created and os.path.islink(self._skill_link_created):
+        if self._skill_link_created and _is_plugin_skill_link(self._skill_link_created):
             try:
                 os.unlink(self._skill_link_created)
                 skills_dir = os.path.dirname(self._skill_link_created)
