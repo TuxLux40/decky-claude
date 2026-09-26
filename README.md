@@ -133,7 +133,13 @@ plugin folder.
 
 ## Usage
 
-1. In Gaming Mode: Quick Access (⋯) → **Claude Code**.
+1. In Gaming Mode: open Quick Access (⋯) and pick the **Claude** icon in the
+   sidebar — or go through the Decky tab → **Claude Code**. The sidebar icon can
+   be turned off with **Settings → Show in Quick Access sidebar** at the bottom
+   of the panel (on by default; applies the next time Quick Access opens).
+   Decky has no public API for sidebar tabs, so this uses Decky Loader
+   internals: if a Decky update breaks them, the toggle shows as unavailable
+   and the plugin stays reachable through the Decky tab.
 2. Leave **Session** on *New session* and pick a working directory, or choose a
    past session to pick up where it left off — resuming replays the transcript
    in the directory it was recorded in, so the working directory follows from
@@ -153,6 +159,7 @@ The panel's **Screen Preview** section is for you, not Claude — Claude capture
 | `machine_profile.py` | Probes hardware/OS/session/Steam into the session's CLAUDE.md; run standalone to inspect |
 | `deck_common.py` | Display environment and xdotool/ydotool commands shared by both |
 | `src/index.tsx` | Quick Access panel (React, built to `dist/` by rollup) |
+| `src/sidebarTab.tsx` | Optional dedicated Quick Access sidebar tab (Decky internals, isolated) |
 | `skills/steam-debugger` | Symlink to `vendor/skills/skills/steam-debugger` — the bundled Claude Code skill, autoloaded into sessions (dereferenced into real files at packaging time) |
 | `vendor/skills/` | Git submodule: [TuxLux40/skills](https://github.com/TuxLux40/skills), source of truth for the skill |
 | `.github/dependabot.yml` | Daily submodule bumps (skill updates) + weekly GitHub Actions bumps |

@@ -1170,3 +1170,46 @@ class Plugin:
         finally:
             if self._status == "running":
                 self._status = "stopped"
+
+    # ── settings API ───────────────────────────────────────────────────────────
+
+    async def get_sidebar_tab(self):
+        """Whether the dedicated Quick Access sidebar tab is shown (default on)."""
+        return {"enabled": bool(_load_settings().get("sidebar_tab", True))}
+
+    async def set_sidebar_tab(self, enabled: bool):
+        settings = _load_settings()
+        settings["sidebar_tab"] = bool(enabled)
+        _save_settings(settings)
+        return {"enabled": settings["sidebar_tab"]}
+
+
+# ── persisted settings ──────────────────────────────────────────────────────────
+
+# Decky exports DECKY_SETTINGS_DIR (~/homebrew/settings/<plugin>), which
+# survives plugin updates; the fallback only matters outside the loader.
+_SETTINGS_PATH = os.path.join(
+    os.environ.get("DECKY_SETTINGS_DIR")
+    or os.path.join(_USER_HOME, ".config", "decky-claude"),
+    "settings.json",
+)
+
+
+def _load_settings() -> dict:
+    try:
+        with open(_SETTINGS_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.error("could not read %s: %s", _SETTINGS_PATH, exc)
+        return {}
+
+
+def _save_settings(settings: dict) -> None:
+    os.makedirs(os.path.dirname(_SETTINGS_PATH), exist_ok=True)
+    tmp_path = _SETTINGS_PATH + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(settings, f, indent=2)
+    os.replace(tmp_path, _SETTINGS_PATH)
