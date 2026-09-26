@@ -13,6 +13,7 @@ import { callable, definePlugin } from "@decky/api";
 import { useEffect, useMemo, useState } from "react";
 import { FaTerminal } from "react-icons/fa";
 import qrcode from "qrcode-generator";
+import { disposeSidebarTab, initSidebarTab, SidebarTabToggle } from "./sidebarTab";
 
 // ── backend callables ──────────────────────────────────────────────────────────
 
@@ -842,16 +843,27 @@ function Content() {
           </PanelSectionRow>
         )}
       </PanelSection>
+
+      <PanelSection title="Settings">
+        <PanelSectionRow>
+          <SidebarTabToggle />
+        </PanelSectionRow>
+      </PanelSection>
     </>
   );
 }
 
 // ── plugin entry ───────────────────────────────────────────────────────────────
 
-export default definePlugin(() => ({
-  name: "Claude Code",
-  title: <div className={staticClasses.Title}>Claude Code</div>,
-  icon: <FaTerminal />,
-  content: <Content />,
-  onDismount() {},
-}));
+export default definePlugin(() => {
+  initSidebarTab(<Content />);
+  return {
+    name: "Claude Code",
+    title: <div className={staticClasses.Title}>Claude Code</div>,
+    icon: <FaTerminal />,
+    content: <Content />,
+    onDismount() {
+      disposeSidebarTab();
+    },
+  };
+});
