@@ -1,12 +1,7 @@
 name: Build & Release
 
-# Every push builds the plugin zip and publishes it:
-# - main: a versioned release marked "latest" — installed copies pick it up
-#   through the plugin's self-updater (GitHub "latest release" -> Decky).
-# - any other branch: one rolling pre-release per branch (tag dev-<branch>),
-#   replaced on each push and removed when the branch is deleted. The
-#   updater's releases/latest endpoint never returns pre-releases, so branch
-#   builds can be installed by hand but never reach users automatically.
+# Every push to main becomes a release; installed copies pick it up through the
+# plugin's self-updater (GitHub "latest release" -> Decky's installer).
 #
 # Versioning: next = max(latest v* tag with patch+1, version in package.json).
 # So routine merges get a patch bump automatically, and a minor/major bump is
@@ -18,10 +13,9 @@ name: Build & Release
 on:
   push:
     branches:
-      - "**"
+      - main
     tags:
       - "v*"
-  delete:
   workflow_dispatch:
 
 permissions:
@@ -29,12 +23,11 @@ permissions:
 
 # Serialise releases so two quick merges can't compute the same version.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 jobs:
   build:
-    if: github.event_name != 'delete'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,19 +40,8 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --tags --force
-          channel=release
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             version="${GITHUB_REF_NAME#v}"
-            skip=false
-          elif [[ "$GITHUB_REF" != refs/heads/main ]]; then
-            # Branch build: next patch version with a dev suffix, rolling tag.
-            latest="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)"
-            latest="${latest#v}"; latest="${latest:-1.0.0}"
-            IFS=. read -r major minor patch <<< "${latest%%-*}"
-            branch="$(printf '%s' "$GITHUB_REF_NAME" | tr -c 'A-Za-z0-9._-' '-')"
-            version="${major}.${minor}.$((patch + 1))-dev.${GITHUB_RUN_NUMBER}"
-            echo "tag=dev-$branch" >> "$GITHUB_OUTPUT"
-            channel=dev
             skip=false
           else
             # Already released this exact commit (e.g. re-run / manual dispatch)?
@@ -83,8 +65,7 @@ jobs:
             fi
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          [[ "$channel" == dev ]] || echo "tag=v$version" >> "$GITHUB_OUTPUT"
-          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
           echo "skip=$skip" >> "$GITHUB_OUTPUT"
           echo "Version: $version (skip release: $skip)"
 
@@ -140,7 +121,7 @@ jobs:
             out/decky-claude.zip.sha256
 
       - name: Create GitHub Release
-        if: steps.version.outputs.skip != 'true' && steps.version.outputs.channel == 'release'
+        if: steps.version.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
@@ -162,34 +143,3 @@ jobs:
             --notes-file "$notes" \
             --generate-notes \
             --latest
-
-      - name: Publish branch pre-release
-        if: steps.version.outputs.channel == 'dev'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.version.outputs.tag }}
-          VERSION: ${{ steps.version.outputs.version }}
-          SHA256: ${{ steps.package.outputs.sha256 }}
-        run: |
-          set -euo pipefail
-          # Rolling: replace the previous build of this branch.
-          gh release delete "$TAG" --cleanup-tag --yes 2>/dev/null || true
-          gh release create "$TAG" \
-            out/decky-claude.zip out/decky-claude.zip.sha256 \
-            --target "$GITHUB_SHA" \
-            --title "$VERSION ($GITHUB_REF_NAME)" \
-            --notes "Branch build of \`$GITHUB_REF_NAME\` at ${GITHUB_SHA::7} — for testing; installed copies never auto-update to this. sha256: \`$SHA256\`" \
-            --prerelease
-
-  cleanup:
-    # Deleting a branch removes its rolling pre-release.
-    if: github.event_name == 'delete' && github.event.ref_type == 'branch'
-    runs-on: ubuntu-latest
-    steps:
-      - env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          BRANCH: ${{ github.event.ref }}
-        run: |
-          tag="dev-$(printf '%s' "$BRANCH" | tr -c 'A-Za-z0-9._-' '-')"
-          gh release delete "$tag" --cleanup-tag --yes || true

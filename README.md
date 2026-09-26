@@ -193,7 +193,7 @@ Screenshots happen in the chat: Claude captures on its own via the `screenshot` 
 | `vendor/skills/` | Git submodule: [TuxLux40/skills](https://github.com/TuxLux40/skills), source of truth for the skill |
 | `.github/dependabot.yml` | Daily submodule bumps (skill updates) + weekly GitHub Actions bumps |
 | `assets/` | Plugin icon (D-pad + Claude spark) as SVG source and PNG |
-| `.github/workflows/release.yml` | Builds `decky-claude.zip` on every push: `main` → versioned release (what installs auto-update to); other branches → rolling `dev-<branch>` pre-release for testing |
+| `.github/workflows/release.yml` | Builds `decky-claude.zip` and publishes a release on every push to `main` |
 
 ## Roadmap
 
