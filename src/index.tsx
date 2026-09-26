@@ -7,12 +7,13 @@ import {
   PanelSectionRow,
   staticClasses,
   TextField,
-  ToggleField,
 } from "@decky/ui";
 import { callable, definePlugin } from "@decky/api";
 import { useEffect, useMemo, useState } from "react";
 import { FaTerminal } from "react-icons/fa";
 import qrcode from "qrcode-generator";
+import { disposeSidebarTab, initSidebarTab, SidebarTabToggle } from "./sidebarTab";
+import { startAutoUpdate, UpdateSection } from "./update";
 
 // ── backend callables ──────────────────────────────────────────────────────────
 
@@ -33,12 +34,6 @@ const getStatus = callable<
   }
 >("get_status");
 const listDirs = callable<[], { dirs: string[] }>("list_dirs");
-
-const captureScreenshot = callable<
-  [boolean],
-  { success: boolean; path?: string; thumbnail?: string; error?: string }
->("capture_screenshot");
-const getScreenState = callable<[], { thumbnail: string | null }>("get_screen_state");
 
 const sendKey = callable<[string], { success: boolean; error?: string }>("send_key");
 const sendText = callable<[string], { success: boolean; error?: string }>("send_text");
@@ -165,7 +160,6 @@ function Content() {
   // kicked off, so isRunning can't be used to tell "starting" from "stopping".
   const [sessionAction, setSessionAction] = useState<"start" | "stop" | null>(null);
   const [sessionError, setSessionError] = useState<string | null>(null);
-  const [urlCopied, setUrlCopied] = useState(false);
   const [skill, setSkill] = useState<string | null>(null);
 
   // auth
@@ -182,15 +176,8 @@ function Content() {
   // "" = start a fresh session; otherwise the transcript id to resume
   const [resumeId, setResumeId] = useState("");
 
-  // screen
-  const [thumbnail, setThumbnail] = useState<string | null>(null);
-  const [captureLoading, setCaptureLoading] = useState(false);
-  const [captureError, setCaptureError] = useState<string | null>(null);
-  // gamescope excludes the Steam overlay (QAM, notifications) from a capture
-  // by default, same as the physical screenshot button — this opts in.
-  const [includeSteamUi, setIncludeSteamUi] = useState(false);
-
   // input
+  const [inputOpen, setInputOpen] = useState(false);
   const [typeText, setTypeText] = useState("");
   const [inputFeedback, setInputFeedback] = useState<{ msg: string; ok: boolean } | null>(null);
 
@@ -207,9 +194,6 @@ function Content() {
     syncStatus();
     syncAuth();
     syncMachineSessions();
-    getScreenState()
-      .then((r) => { if (r.thumbnail) setThumbnail(r.thumbnail); })
-      .catch(logPollFailure);
   }, []);
 
   useEffect(() => {
@@ -363,36 +347,6 @@ function Content() {
     }
   }
 
-  function copyUrl() {
-    if (!sessionUrl) return;
-    const el = document.createElement("textarea");
-    el.value = sessionUrl;
-    document.body.appendChild(el);
-    el.select();
-    document.execCommand("copy");
-    document.body.removeChild(el);
-    setUrlCopied(true);
-    setTimeout(() => setUrlCopied(false), 2000);
-  }
-
-  // ── screen ──
-  async function handleCapture() {
-    setCaptureLoading(true);
-    setCaptureError(null);
-    try {
-      const r = await captureScreenshot(includeSteamUi);
-      if (r.success && r.thumbnail) {
-        setThumbnail(r.thumbnail);
-      } else if (!r.success) {
-        setCaptureError(r.error ?? "Capture failed");
-      }
-    } catch (e) {
-      setCaptureError(errorText(e, "Capture failed"));
-    } finally {
-      setCaptureLoading(false);
-    }
-  }
-
   // ── input ──
   function showFeedback(msg: string, ok: boolean) {
     setInputFeedback({ msg, ok });
@@ -432,6 +386,7 @@ function Content() {
   // A live session is already attached to a claude process; resuming it a
   // second time would run two clients against one transcript.
   const resumable = machineSessions.filter((s) => !s.live);
+  const liveElsewhere = machineSessions.filter((s) => s.live && !s.current).length;
   const resumeSession = machineSessions.find((s) => s.id === resumeId) ?? null;
   const statusColor = STATUS_COLOR[status] ?? "#888";
   const statusLabel =
@@ -503,6 +458,10 @@ function Content() {
 
       {/* ── Remote Session ─────────────────────────────────────────────── */}
       <PanelSection title="Claude Code Remote">
+        {/* The QAM scrolls by following D-pad focus; without a focus target
+            up here, the status and URL above the first button can never be
+            scrolled back into view. */}
+        <Focusable onActivate={() => {}}>
         <PanelSectionRow>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <div
@@ -546,17 +505,14 @@ function Content() {
               </div>
             </PanelSectionRow>
             <PanelSectionRow>
-              <ButtonItem layout="below" onClick={copyUrl}>
-                {urlCopied ? "Copied!" : "Copy Session URL"}
-              </ButtonItem>
-            </PanelSectionRow>
-            <PanelSectionRow>
               <div style={{ fontSize: 11, color: "#aaa" }}>
                 Claude app → Code tab → connect. Claude will screenshot automatically when you ask about the game.
               </div>
             </PanelSectionRow>
           </>
         )}
+
+        </Focusable>
 
         {status === "starting" && !sessionUrl && (
           <PanelSectionRow>
@@ -596,6 +552,15 @@ function Content() {
                 onChange={(opt) => setResumeId(opt.data)}
               />
             </PanelSectionRow>
+
+            {liveElsewhere > 0 && (
+              <PanelSectionRow>
+                <div style={{ fontSize: 10, color: "#888", lineHeight: 1.4 }}>
+                  {liveElsewhere} more running elsewhere on this device — open{" "}
+                  {liveElsewhere === 1 ? "it" : "them"} from the Claude app.
+                </div>
+              </PanelSectionRow>
+            )}
 
             {/* Resuming replays a transcript, and that only works in the
                 directory it was recorded in — so the backend picks the cwd. */}
@@ -643,150 +608,14 @@ function Content() {
         )}
       </PanelSection>
 
-      {/* ── Sessions on this machine ───────────────────────────────────── */}
-      {machineSessions.length > 0 && (
-        <PanelSection title="Sessions on this device">
-          {/* DialogButton applies its own background/border via focus/hover
-              CSS that otherwise beats the inline style below — that CSS wins
-              specifically while a row has D-pad focus, i.e. exactly while the
-              user is looking at it to judge what's selected. The doubled
-              class raises specificity above a single-class selector, and the
-              :hover/:focus variants make sure the selected look survives
-              those states rather than just the resting one. */}
-          <style>{`
-            .decky-claude-session-row.decky-claude-session-row[data-selected="true"],
-            .decky-claude-session-row.decky-claude-session-row[data-selected="true"]:hover,
-            .decky-claude-session-row.decky-claude-session-row[data-selected="true"]:focus {
-              background-color: rgba(91,163,245,0.22) !important;
-              border-color: rgba(91,163,245,0.85) !important;
-            }
-          `}</style>
-          {machineSessions.map((s) => {
-            const selected = s.id === resumeId;
-            const selectable = !s.live && !isRunning;
-            return (
-              <PanelSectionRow key={s.id}>
-                <DialogButton
-                  // Rows are buttons rather than divs so the D-pad can reach
-                  // them: the Quick Access panel scrolls to whatever has focus,
-                  // and unfocusable content is a dead end for gamepad users.
-                  onClick={() => selectable && setResumeId(s.id)}
-                  className="decky-claude-session-row"
-                  data-selected={selected}
-                  style={{
-                    width: "100%", minWidth: 0, padding: "6px 8px",
-                    textAlign: "left", display: "flex", alignItems: "center", gap: 8,
-                    background: selected ? "rgba(91,163,245,0.18)" : "rgba(255,255,255,0.04)",
-                    border: selected
-                      ? "1px solid rgba(91,163,245,0.6)"
-                      : "1px solid transparent",
-                  }}
-                >
-                  <div
-                    style={{
-                      width: 8, height: 8, borderRadius: "50%", flexShrink: 0,
-                      background: s.live ? "#4caf50" : "#555",
-                      boxShadow: s.live ? "0 0 6px #4caf50" : "none",
-                    }}
-                  />
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{
-                      fontSize: 12, fontWeight: s.current ? 700 : 500,
-                      color: s.current ? "#5ba3f5" : "#ddd",
-                      overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                    }}>
-                      {s.label}{s.current ? " (this panel)" : ""}
-                    </div>
-                    {s.preview && (
-                      <div style={{
-                        fontSize: 10, color: "#9aa",
-                        overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                      }}>
-                        {s.preview}
-                      </div>
-                    )}
-                    <div style={{
-                      fontSize: 10, color: "#777",
-                      overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                    }}>
-                      {s.live ? "running" : relativeTime(s.mtime)} · {s.short_id}
-                      {/* Once the resume actually started, "will resume" is
-                          just wrong — s.current already says it's live here. */}
-                      {selected && !isRunning ? " · will resume" : ""}
-                    </div>
-                  </div>
-                  {/* Text content, not CSS — stays visible even if DialogButton's
-                      own focus/hover styling wins the background fight above. */}
-                  {selected && (
-                    <div
-                      aria-hidden
-                      style={{ fontSize: 14, color: "#5ba3f5", flexShrink: 0, lineHeight: 1 }}
-                    >
-                      ✓
-                    </div>
-                  )}
-                </DialogButton>
-              </PanelSectionRow>
-            );
-          })}
-          <PanelSectionRow>
-            <div style={{ fontSize: 10, color: "#666", lineHeight: 1.4 }}>
-              Green means a claude process is live in that directory — open those
-              from the Claude app. Pick any other one to resume it here, then hit
-              Resume Session.
-            </div>
-          </PanelSectionRow>
-        </PanelSection>
-      )}
-
-      {/* ── Screen Preview ──────────────────────────────────────────────── */}
-      <PanelSection title="Screen Preview">
-        {thumbnail && (
-          <PanelSectionRow>
-            <img
-              src={`data:image/png;base64,${thumbnail}`}
-              style={{
-                width: "100%", borderRadius: 6, display: "block",
-                border: "1px solid rgba(255,255,255,0.1)",
-              }}
-              alt="Last capture"
-            />
-          </PanelSectionRow>
-        )}
-
-        <PanelSectionRow>
-          <ToggleField
-            label="Include Steam UI"
-            description="Also capture the Quick Access Menu / overlay, not just the game"
-            checked={includeSteamUi}
-            onChange={setIncludeSteamUi}
-          />
-        </PanelSectionRow>
-
-        <PanelSectionRow>
-          <ButtonItem layout="below" onClick={handleCapture} disabled={captureLoading}>
-            {captureLoading ? "Capturing…" : "Capture Screen"}
-          </ButtonItem>
-        </PanelSectionRow>
-
-        {captureError && (
-          <PanelSectionRow>
-            <div style={{ fontSize: 11, color: "#f44336" }}>{captureError}</div>
-          </PanelSectionRow>
-        )}
-
-        <PanelSectionRow>
-          <div style={{ fontSize: 11, color: "#555", lineHeight: 1.4 }}>
-            For your own preview — Claude captures on its own when you ask it
-            something. By default a capture is the game/desktop frame only,
-            same as the physical screenshot button; the overlay shown here
-            isn't part of it unless "Include Steam UI" is on.
-          </div>
-        </PanelSectionRow>
-      </PanelSection>
-
       {/* ── Manual Input ────────────────────────────────────────────────── */}
       <PanelSection title="Manual Input">
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={() => setInputOpen((o) => !o)}>
+            {inputOpen ? "Hide controls ▴" : "Show controls ▾"}
+          </ButtonItem>
+        </PanelSectionRow>
+        {inputOpen && (<>
         <PanelSectionRow>
           <div style={{
             fontSize: 11, color: "#f0a500",
@@ -856,17 +685,33 @@ function Content() {
             </div>
           </PanelSectionRow>
         )}
+        </>)}
       </PanelSection>
+
+      <PanelSection title="Settings">
+        <PanelSectionRow>
+          <SidebarTabToggle />
+        </PanelSectionRow>
+      </PanelSection>
+      {/* ── Plugin Updates (see update.tsx) ─────────────────────────────── */}
+      <UpdateSection />
     </>
   );
 }
 
 // ── plugin entry ───────────────────────────────────────────────────────────────
 
-export default definePlugin(() => ({
-  name: "Claude Code",
-  title: <div className={staticClasses.Title}>Claude Code</div>,
-  icon: <FaTerminal />,
-  content: <Content />,
-  onDismount() {},
-}));
+export default definePlugin(() => {
+  initSidebarTab(<Content />);
+  const stopAutoUpdate = startAutoUpdate();
+  return {
+    name: "Claude Code",
+    title: <div className={staticClasses.Title}>Claude Code</div>,
+    icon: <FaTerminal />,
+    content: <Content />,
+    onDismount() {
+      disposeSidebarTab();
+      stopAutoUpdate();
+    },
+  };
+});

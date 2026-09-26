@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # Bumps the vendor/skills submodule (TuxLux40/skills) so upstream changes to
+  # the bundled steam-debugger skill arrive as PRs.
+  - package-ecosystem: "gitsubmodule"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    commit-message:
+      prefix: "skills"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

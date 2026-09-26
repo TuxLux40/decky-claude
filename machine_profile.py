@@ -270,12 +270,17 @@ def render(profile: dict, max_games: int = 15) -> str:
         f"- Running as `{se['user']}`, home `{se['home']}`",
     ]
     if se["gaming_mode"]:
-        lines.append(f"- Gaming Mode (gamescope, `{se['gamescope_socket']}`) — screenshots and input work.")
+        lines.append(
+            f"- At session start: Gaming Mode (gamescope, `{se['gamescope_socket']}`) — "
+            "screenshots and input worked then. The user can switch modes at any "
+            "time; call `session_context` for the live state."
+        )
     else:
         lines.append(
-            f"- **Not in Gaming Mode** (desktop session{': ' + se['desktop'] if se['desktop'] else ''}). "
-            "`screenshot` will refuse: capture goes through gamescope, so it "
-            "needs Gaming Mode. Ask the user to switch if you need to see the screen."
+            f"- At session start: **not in Gaming Mode** (desktop session"
+            f"{': ' + se['desktop'] if se['desktop'] else ''}). `screenshot` and "
+            "input refuse outside Gaming Mode (capture goes through gamescope). "
+            "The user may switch later — call `session_context` for the live state."
         )
 
     if st.get("installed"):

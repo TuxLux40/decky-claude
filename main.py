@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import fcntl
 import glob
 import json
@@ -106,12 +105,13 @@ def _claude_md_block(skill_name: str | None, machine_md: str = "") -> str:
     skill_section = ""
     if skill_name:
         skill_section = f"""
-## Steam debugger skill — load it first
+## Steam debugger skill — preloaded, always active
 
-The user's `{skill_name}` skill is installed for this session
-(`.claude/skills/{skill_name}`). BLOCKING REQUIREMENT: invoke the
-`{skill_name}` skill via the Skill tool at the start of the session, before
-doing any Steam or game debugging work, and follow its instructions.
+The `{skill_name}` skill's SKILL.md is already part of your system prompt
+(the plugin injects it on every start and resume). Follow it for all Steam,
+Steam Input, gamescope, Proton and game work, and read its reference files
+as it directs before experimenting. It is also linked at
+`.claude/skills/{skill_name}`.
 """
     machine_section = f"\n{machine_md}\n" if machine_md else ""
     return f"""\
@@ -145,6 +145,8 @@ likely on their phone, and may not be able to read long output comfortably.
 - **type_text** — Type a string into the focused window.
 - **mouse_move_click** — Move to (x, y) pixel coordinates and click.
   Steam Deck native resolution is 1280×800.
+- **session_context** — Live check: Gaming vs Desktop Mode (screenshot/input
+  only work in Gaming Mode) and whether this session runs inside the plugin.
 
 ## Behaviour rules
 
@@ -157,8 +159,273 @@ likely on their phone, and may not be able to read long output comfortably.
    logs — combine the terminal view with the visual view.
 4. **After sending input or triggering an action**: verify via another
    screenshot or `steam_ui_eval` read.
+5. **Check where you are, live**: call `session_context` before using
+   `screenshot`/`send_key`/`type_text`/`mouse_move_click` and before
+   restarting `plugin_loader.service`. The mode can change mid-session; the
+   machine profile above is only a snapshot from session start. A session
+   launched by this plugin runs under PluginLoader and **dies instantly, with
+   no auto-resume, when `plugin_loader.service` restarts** — warn the user and
+   do it last (or let them run it). Standalone terminal sessions are unaffected.
 {_MD_END}
 """
+
+
+# ── self-update ────────────────────────────────────────────────────────────────
+# The plugin is not in the Decky store, so Decky never tells anyone a new
+# version exists. We ask GitHub for the latest release ourselves; the actual
+# install is handed to Decky's own installer by the frontend
+# (utilities/install_plugin), exactly the path the store uses. Nothing here
+# writes plugin files.
+
+_UPDATE_REPO = "TuxLux40/decky-claude"
+_UPDATE_API = f"https://api.github.com/repos/{_UPDATE_REPO}/releases/latest"
+_UPDATE_ASSET = "decky-claude.zip"
+_UPDATE_TTL = 6 * 3600       # a successful check is good for this long
+_UPDATE_RETRY = 15 * 60      # back off this long after a failed check
+_SHA256_RE = re.compile(r"\b[0-9a-fA-F]{64}\b")
+
+
+def _plugin_setting_dir(env_key: str, fallback: str) -> str:
+    path = os.environ.get(env_key) or os.path.join(
+        _USER_HOME, "homebrew", fallback, "decky-claude"
+    )
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _settings_path() -> str:
+    # Decky keeps DECKY_PLUGIN_SETTINGS_DIR across reinstalls/updates (only the
+    # plugin directory is replaced), so this survives the updates it enables.
+    return os.path.join(_plugin_setting_dir("DECKY_PLUGIN_SETTINGS_DIR", "settings"), "settings.json")
+
+
+def _load_settings() -> dict:
+    try:
+        with open(_settings_path()) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_setting(key: str, value) -> None:
+    """Read-modify-write so keys owned by other features are preserved."""
+    data = _load_settings()
+    data[key] = value
+    path = _settings_path()
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def _installed_version() -> str:
+    try:
+        with open(os.path.join(_PLUGIN_DIR, "package.json")) as f:
+            return str(json.load(f).get("version") or "0.0.0")
+    except (OSError, ValueError):
+        return os.environ.get("DECKY_PLUGIN_VERSION", "0.0.0")
+
+
+def _version_tuple(v: str) -> tuple[int, ...]:
+    """'v1.2.3' / '1.2.3-rc1' -> (1, 2, 3). Unparseable parts count as 0."""
+    core = v.strip().lstrip("vV").split("-", 1)[0].split("+", 1)[0]
+    out = []
+    for part in core.split("."):
+        m = re.match(r"\d+", part)
+        out.append(int(m.group(0)) if m else 0)
+    while len(out) < 3:
+        out.append(0)
+    return tuple(out)
+
+
+def _ssl_context():
+    import ssl
+
+    # Decky's bundled Python may not find the distro CA store on its own;
+    # certifi ships with it (aiohttp depends on it), then fall back to the
+    # usual system bundle locations.
+    try:
+        import certifi  # type: ignore
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        pass
+    for cafile in (
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/cert.pem",
+    ):
+        if os.path.isfile(cafile):
+            try:
+                return ssl.create_default_context(cafile=cafile)
+            except Exception:
+                continue
+    return ssl.create_default_context()
+
+
+def _http_get(url: str, headers: dict | None = None, timeout: float = 10):
+    """Blocking GET -> (status, headers, body). 304 is returned, not raised."""
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "decky-claude-updater",
+        **(headers or {}),
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
+            return resp.status, dict(resp.headers), resp.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304:
+            return 304, dict(exc.headers or {}), b""
+        raise
+
+
+def _parse_release(data: dict, sha_fetcher) -> dict:
+    tag = str(data.get("tag_name") or "")
+    asset = next(
+        (a for a in data.get("assets") or [] if a.get("name") == _UPDATE_ASSET), None
+    )
+    if not tag or not asset:
+        raise ValueError(f"latest release {tag or '?'} has no {_UPDATE_ASSET}")
+    # GitHub reports "digest": "sha256:<hex>" on assets; the CI also publishes
+    # a .sha256 asset as a fallback for older API responses.
+    digest = str(asset.get("digest") or "")
+    sha = digest.split(":", 1)[1] if digest.startswith("sha256:") else ""
+    if not sha:
+        sha_asset = next(
+            (a for a in data.get("assets") or []
+             if a.get("name") == _UPDATE_ASSET + ".sha256"),
+            None,
+        )
+        if sha_asset:
+            m = _SHA256_RE.search(sha_fetcher(sha_asset["browser_download_url"]))
+            sha = m.group(0) if m else ""
+    return {
+        "tag": tag,
+        "version": tag.lstrip("vV"),
+        "artifact": asset["browser_download_url"],
+        "hash": sha.lower(),
+        "url": data.get("html_url") or "",
+        "published_at": data.get("published_at") or "",
+    }
+
+
+def _fetch_latest_release(etag: str) -> tuple[dict | None, str]:
+    """Blocking. Returns (release or None if unchanged, new etag)."""
+    headers = {"Accept": "application/vnd.github+json"}
+    if etag:
+        # Conditional requests answered with 304 don't count against the
+        # 60/h unauthenticated rate limit.
+        headers["If-None-Match"] = etag
+    status, resp_headers, body = _http_get(_UPDATE_API, headers)
+    new_etag = resp_headers.get("ETag") or resp_headers.get("Etag") or ""
+    if status == 304:
+        return None, new_etag or etag
+    release = _parse_release(
+        json.loads(body),
+        lambda url: _http_get(url)[2].decode("utf-8", errors="replace"),
+    )
+    return release, new_etag
+
+
+class _Updater:
+    """Cached, non-blocking latest-release lookup."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._cache: dict = {}
+        self._error: str | None = None
+        self._error_at = 0.0
+        self._loaded = False
+
+    @staticmethod
+    def _cache_path() -> str:
+        return os.path.join(_plugin_setting_dir("DECKY_PLUGIN_RUNTIME_DIR", "data"), "update_cache.json")
+
+    def _load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        try:
+            with open(self._cache_path()) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self._cache = data
+        except (OSError, ValueError):
+            pass
+
+    def _store(self) -> None:
+        try:
+            with open(self._cache_path(), "w") as f:
+                json.dump(self._cache, f)
+        except OSError:
+            logger.warning("could not persist update cache", exc_info=True)
+
+    async def latest(self, force: bool = False) -> tuple[dict | None, str | None]:
+        import time
+
+        async with self._lock:
+            self._load()
+            now = time.time()
+            fresh = now - float(self._cache.get("checked_at") or 0) < _UPDATE_TTL
+            backing_off = now - self._error_at < _UPDATE_RETRY
+            if not force and (fresh or backing_off):
+                return self._cache.get("release"), self._error
+            try:
+                release, etag = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _fetch_latest_release,
+                        self._cache.get("etag", "") if self._cache.get("release") else "",
+                    ),
+                    timeout=30,
+                )
+            except Exception as exc:
+                import urllib.error
+
+                if isinstance(exc, urllib.error.HTTPError) and exc.code in (403, 429):
+                    msg = "GitHub rate limit reached, will retry later"
+                elif isinstance(exc, urllib.error.HTTPError) and exc.code == 404:
+                    msg = "No release published yet"
+                elif isinstance(exc, (urllib.error.URLError, OSError, asyncio.TimeoutError)):
+                    msg = "Offline or GitHub unreachable"
+                else:
+                    msg = f"Update check failed: {exc}"
+                logger.info("update check: %s (%r)", msg, exc)
+                self._error, self._error_at = msg, now
+                return self._cache.get("release"), self._error
+            if release is not None:
+                self._cache["release"] = release
+            self._cache["etag"] = etag
+            self._cache["checked_at"] = now
+            self._error, self._error_at = None, 0.0
+            self._store()
+            return self._cache.get("release"), None
+
+    def checked_at(self) -> float:
+        return float(self._cache.get("checked_at") or 0)
+
+
+_updater: _Updater | None = None
+
+
+def _get_updater() -> _Updater:
+    # Created lazily so its asyncio.Lock binds to Decky's running loop.
+    global _updater
+    if _updater is None:
+        _updater = _Updater()
+    return _updater
+
+# ── end self-update ────────────────────────────────────────────────────────────
+
+
+def _is_plugin_skill_link(path: str) -> bool:
+    """True if path is a symlink into this plugin's bundled skills."""
+    if not os.path.islink(path):
+        return False
+    target = os.path.abspath(os.path.join(os.path.dirname(path), os.readlink(path)))
+    return target.startswith(os.path.join(_PLUGIN_DIR, "skills") + os.sep)
 
 
 class Plugin:
@@ -179,9 +446,6 @@ class Plugin:
     _login_proc: asyncio.subprocess.Process | None = None
     _login_fd: int | None = None
     _login_url: str | None = None
-
-    # ── screen state ───────────────────────────────────────────────────────────
-    _last_thumb_b64: str | None = None
 
     @staticmethod
     def _machine_md() -> str:
@@ -260,6 +524,11 @@ class Plugin:
         master_fd, slave_fd = pty.openpty()
 
         argv = [claude_bin, "--remote-control", "--mcp-config", mcp_config]
+        # The skill is this plugin's core; an instruction to load it proved
+        # ignorable, so its SKILL.md goes straight into the system prompt.
+        preload = self._write_skill_preload()
+        if preload:
+            argv += ["--append-system-prompt-file", preload]
         if resume_id:
             argv += ["--resume", resume_id]
             self._session_id = resume_id
@@ -673,19 +942,6 @@ class Plugin:
             pass
         return {"dirs": dirs}
 
-    # ── screenshot API (for panel preview only) ────────────────────────────────
-
-    async def capture_screenshot(self, include_steam_ui: bool = False):
-        """Manual capture for the panel thumbnail — Claude uses the MCP tool instead."""
-        out_path = "/tmp/decky-claude-preview.png"
-        result = await self._take_screenshot(out_path, include_steam_ui)
-        if result["success"]:
-            self._last_thumb_b64 = await self._make_thumb(out_path)
-        return {**result, "thumbnail": self._last_thumb_b64}
-
-    async def get_screen_state(self):
-        return {"thumbnail": self._last_thumb_b64}
-
     # ── input API (manual controls in the panel) ───────────────────────────────
 
     async def send_key(self, key: str):
@@ -839,6 +1095,43 @@ class Plugin:
                         return path
         return None
 
+    def _write_skill_preload(self) -> str | None:
+        """Compose SKILL.md (minus frontmatter) with absolute reference paths
+        into a file for --append-system-prompt-file; None if no skill."""
+        src = self._find_steam_debugger_skill()
+        if not src:
+            logger.error("steam-debugger skill not found in %s — session starts without it", _SKILL_BASES)
+            return None
+        src = os.path.realpath(src)
+        try:
+            with open(os.path.join(src, "SKILL.md")) as f:
+                body = f.read()
+        except OSError as exc:
+            logger.error("cannot read %s/SKILL.md: %s", src, exc)
+            return None
+        if body.startswith("---"):
+            end = body.find("\n---", 3)
+            if end != -1:
+                body = body[end + 4:].lstrip("\n")
+        text = (
+            "# steam-debugger skill (preloaded by decky-claude, always active)\n\n"
+            "This is the full SKILL.md of the steam-debugger skill, loaded "
+            "automatically for this session. Follow it for all Steam, Steam "
+            "Input, gamescope, Proton and game work. Its files live in "
+            f"`{src}/` — when it refers to `reference/<file>.md` or "
+            f"`scripts/...`, use `{src}/reference/<file>.md` / `{src}/scripts/...`.\n\n"
+            "---\n\n" + body
+        )
+        path = os.path.join(_plugin_setting_dir("DECKY_PLUGIN_RUNTIME_DIR", "data"), "skill-preload.md")
+        try:
+            with open(path, "w") as f:
+                f.write(text)
+        except OSError as exc:
+            logger.error("cannot write skill preload %s: %s", path, exc)
+            return None
+        logger.info("steam-debugger skill preloaded from %s", src)
+        return path
+
     def _setup_skill(self, working_dir: str) -> None:
         """Symlink the steam-debugger skill into the session's .claude/skills
         so Claude discovers it regardless of working directory."""
@@ -854,10 +1147,10 @@ class Plugin:
         dest = os.path.join(working_dir, ".claude", "skills", name)
         if os.path.realpath(dest) == os.path.realpath(src):
             self._skill_name = name
-            if os.path.islink(dest):
-                # Symlink from a previous session — track it for cleanup
+            # Adopt a leftover link only if we made it. In $HOME, dest is the
+            # user's own ~/.claude/skills override — cleanup must not delete it.
+            if _is_plugin_skill_link(dest):
                 self._skill_link_created = dest
-            # else: working dir already contains the real skill (e.g. /home/deck)
             return
 
         try:
@@ -891,7 +1184,7 @@ class Plugin:
                 pass
 
         # Remove the skill symlink we created (never the user's real skill)
-        if self._skill_link_created and os.path.islink(self._skill_link_created):
+        if self._skill_link_created and _is_plugin_skill_link(self._skill_link_created):
             try:
                 os.unlink(self._skill_link_created)
                 skills_dir = os.path.dirname(self._skill_link_created)
@@ -969,66 +1262,6 @@ class Plugin:
         # Compositor variables are resolved in deck_common so this process and
         # mcp_server.py cannot disagree about which session they are driving.
         return deck_common.apply_display_env(env, _USER_UID)
-
-    # gamescopectl only forwards a single opaque string after the command
-    # name, so a screenshot type is smuggled in as a second whitespace
-    # -separated token — gamescope's own "screenshot" console command
-    # re-splits it into <path> <type> (see mcp_server.py for the full
-    # rationale and the screenshot_type enum). 4 = screen_buffer: the exact
-    # on-screen buffer, Steam overlay included. Unverified on hardware.
-    _SCREENSHOT_TYPE_SCREEN_BUFFER = 4
-
-    async def _take_screenshot(self, out_path: str, include_steam_ui: bool = False) -> dict:
-        env = self._display_env()
-        # This plugin targets Gaming Mode only, so capture goes through
-        # gamescope and nothing else. That is not a fallback among options: it
-        # is the same compositor-side capture the controller's screenshot
-        # button triggers (Steam sets GAMESCOPECTRL_REQUEST_SCREENSHOT and
-        # gamescope does the work), just addressed directly so the frame lands
-        # at a path we choose instead of in the user's Steam screenshot
-        # library. gamescope implements no Wayland screencopy protocol, so
-        # grim and friends cannot capture here regardless.
-        if not env.get("GAMESCOPE_WAYLAND_DISPLAY"):
-            return {
-                "success": False,
-                "error": "Not running under gamescope — screen capture needs Gaming Mode",
-            }
-
-        arg = (
-            f"{out_path} {self._SCREENSHOT_TYPE_SCREEN_BUFFER}"
-            if include_steam_ui
-            else out_path
-        )
-        # Outside a live gamescope, gamescopectl still exits 0 after failing to
-        # connect, so the file itself is the only trustworthy success signal.
-        r = await self._run_cmd(
-            ["gamescopectl", "screenshot", arg], env, timeout=15
-        )
-        if r["success"]:
-            # gamescope writes the file from its own render thread, so it can
-            # land slightly after the command returns.
-            for _ in range(20):
-                if os.path.exists(out_path) and os.path.getsize(out_path):
-                    return {"success": True, "path": out_path}
-                await asyncio.sleep(0.1)
-        return {
-            "success": False,
-            "error": r.get("error") or "gamescope produced no screenshot",
-        }
-
-    async def _make_thumb(self, src: str) -> str | None:
-        thumb = src.replace(".png", "_thumb.png")
-        # Downscale the frame we already have. (grim -s used to be tried first,
-        # but it re-captures rather than resizes and cannot run under gamescope
-        # anyway.) Falls through to the full-size image if convert is absent.
-        r = await self._run_cmd(["convert", "-resize", "30%", src, thumb])
-        if r["success"] and os.path.exists(thumb):
-            src = thumb
-        try:
-            with open(src, "rb") as f:
-                return base64.b64encode(f.read(512 * 1024)).decode()
-        except OSError:
-            return None
 
     async def _run_first(self, cmds: list[list[str]]) -> dict:
         """Run the xdotool/ydotool alternatives until one succeeds, reporting
@@ -1161,3 +1394,50 @@ class Plugin:
         finally:
             if self._status == "running":
                 self._status = "stopped"
+
+    # ── settings API ───────────────────────────────────────────────────────────
+
+    async def get_sidebar_tab(self):
+        """Whether the dedicated Quick Access sidebar tab is shown (default on)."""
+        return {"enabled": bool(_load_settings().get("sidebar_tab", True))}
+
+    async def set_sidebar_tab(self, enabled: bool):
+        _save_setting("sidebar_tab", bool(enabled))
+        return {"enabled": bool(enabled)}
+
+    # ── self-update API ────────────────────────────────────────────────────────
+    # See the "self-update" block above the class. The frontend performs the
+    # install through Decky's utilities/install_plugin; we only report.
+
+    async def get_update_info(self, force: bool = False):
+        release, error = await _get_updater().latest(force=bool(force))
+        current = _installed_version()
+        available = bool(
+            release
+            and release.get("hash")
+            and _version_tuple(release["version"]) > _version_tuple(current)
+        )
+        if release and not release.get("hash") and not error:
+            error = "Latest release has no sha256; refusing to install it"
+        return {
+            "current": current,
+            "latest": release.get("version") if release else None,
+            "update_available": available,
+            "artifact": release.get("artifact") if release else None,
+            "hash": release.get("hash") if release else None,
+            "release_url": release.get("url") if release else None,
+            "checked_at": _get_updater().checked_at(),
+            "error": error,
+            "auto_update": bool(_load_settings().get("auto_update", True)),
+            # Decky uninstalls the old copy first, which unloads this backend
+            # and would end a live session — the frontend won't auto-install
+            # while this is true.
+            "session_active": self._status in ("starting", "running"),
+        }
+
+    async def set_auto_update(self, enabled: bool):
+        try:
+            _save_setting("auto_update", bool(enabled))
+            return {"success": True, "auto_update": bool(enabled)}
+        except OSError as exc:
+            return {"success": False, "error": str(exc)}
