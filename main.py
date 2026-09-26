@@ -142,6 +142,8 @@ likely on their phone, and may not be able to read long output comfortably.
 - **type_text** — Type a string into the focused window.
 - **mouse_move_click** — Move to (x, y) pixel coordinates and click.
   Steam Deck native resolution is 1280×800.
+- **session_context** — Live check: Gaming vs Desktop Mode (screenshot/input
+  only work in Gaming Mode) and whether this session runs inside the plugin.
 
 ## Behaviour rules
 
@@ -154,6 +156,13 @@ likely on their phone, and may not be able to read long output comfortably.
    logs — combine the terminal view with the visual view.
 4. **After sending input or triggering an action**: verify via another
    screenshot or `steam_ui_eval` read.
+5. **Check where you are, live**: call `session_context` before using
+   `screenshot`/`send_key`/`type_text`/`mouse_move_click` and before
+   restarting `plugin_loader.service`. The mode can change mid-session; the
+   machine profile above is only a snapshot from session start. A session
+   launched by this plugin runs under PluginLoader and **dies instantly, with
+   no auto-resume, when `plugin_loader.service` restarts** — warn the user and
+   do it last (or let them run it). Standalone terminal sessions are unaffected.
 {_MD_END}
 """
 

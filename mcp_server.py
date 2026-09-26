@@ -212,11 +212,27 @@ TOOLS = [
         },
     },
     {
+        "name": "session_context",
+        "description": (
+            "Live, read-only check of where this session is running. Returns "
+            "JSON: (1) display mode — 'gaming' (a gamescope process is running; "
+            "screenshot and input tools work) or 'desktop' (they do not; use "
+            "steam_ui_eval/steam_snippet), with the evidence; (2) whether this "
+            "claude process descends from Decky's PluginLoader — if so, "
+            "restarting plugin_loader.service kills this session instantly with "
+            "no auto-resume. Both can change mid-session, so call this before "
+            "screenshot/send_key/type_text/mouse_move_click and before "
+            "restarting plugin_loader.service, instead of assuming."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
         "name": "screenshot",
         "description": (
             "Capture the current screen (game, UI, error dialog, desktop). "
             "Call this at the start of any request that involves the game or "
-            "visual state before answering. Returns a PNG image."
+            "visual state before answering. Returns a PNG image. Gaming Mode "
+            "only — check session_context if unsure."
         ),
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
@@ -334,6 +350,158 @@ def _gamescope_screenshot(path: str) -> str | None:
     return "gamescope produced no screenshot"
 
 
+# ── session context (live "where am I running" probe) ──────────────────────────
+
+# Process names (/proc/<pid>/comm, truncated to 15 chars by the kernel) that
+# mean a Gaming Mode compositor is up. Newer gamescope-session builds run the
+# Wayland-only binary as gamescope-wl.
+_GAMESCOPE_COMMS = {"gamescope", "gamescope-wl"}
+# Desktop compositors / shells, reported only as evidence for Desktop Mode.
+_DESKTOP_COMMS = {
+    "kwin_wayland": "KDE Plasma (Wayland)", "kwin_x11": "KDE Plasma (X11)",
+    "plasmashell": "KDE Plasma", "gnome-shell": "GNOME", "Hyprland": "Hyprland",
+    "sway": "sway", "labwc": "labwc", "weston": "weston", "cosmic-comp": "COSMIC",
+}
+# Decky Loader's process (a PyInstaller binary). Plugin backends, and every
+# claude they spawn, descend from it.
+_LOADER_COMMS = {"PluginLoader", "Decky Loader"}
+_LOADER_UNIT = "plugin_loader.service"
+
+
+def _proc_stat(pid: int) -> tuple[str, int] | None:
+    """(comm, ppid) for a pid, or None if it is gone / unreadable."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            raw = f.read().decode(errors="replace")
+    except OSError:
+        return None
+    # comm is parenthesised and may itself contain spaces or ')'.
+    lpar, rpar = raw.find("("), raw.rfind(")")
+    if lpar < 0 or rpar < 0:
+        return None
+    rest = raw[rpar + 2:].split()
+    try:
+        return raw[lpar + 1:rpar], int(rest[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def _proc_uid(pid: int) -> int | None:
+    try:
+        return os.stat(f"/proc/{pid}").st_uid
+    except OSError:
+        return None
+
+
+def _proc_unit(pid: int) -> str | None:
+    """The systemd unit a pid's cgroup belongs to (last *.service / *.scope)."""
+    try:
+        with open(f"/proc/{pid}/cgroup") as f:
+            path = f.read().strip().splitlines()[-1].split(":", 2)[-1]
+    except (OSError, IndexError):
+        return None
+    units = [p for p in path.split("/") if p.endswith((".service", ".scope"))]
+    return units[-1] if units else None
+
+
+def _find_procs(comms, uid: int | None = None) -> list[dict]:
+    found = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        st = _proc_stat(pid)
+        if not st or st[0] not in comms:
+            continue
+        if uid is not None and _proc_uid(pid) != uid:
+            continue
+        found.append({"pid": pid, "name": st[0]})
+    return found
+
+
+def _ancestors(pid: int, limit: int = 64) -> list[dict]:
+    chain = []
+    while pid > 0 and len(chain) < limit:
+        st = _proc_stat(pid)
+        if not st:
+            break
+        chain.append({"pid": pid, "name": st[0]})
+        pid = st[1]
+    return chain
+
+
+def session_context() -> dict:
+    """Live answer to "which mode is the machine in, and would restarting
+    Decky Loader kill this session?" — both can change mid-session, so this is
+    probed on every call rather than baked into the prompt."""
+    uid = os.getuid()
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{uid}"
+    sockets = sorted(
+        s for s in os.listdir(runtime)
+        if s.startswith(("gamescope-", "wayland-")) and not s.endswith(".lock")
+    ) if os.path.isdir(runtime) else []
+
+    gamescope = _find_procs(_GAMESCOPE_COMMS, uid)
+    desktop = _find_procs(_DESKTOP_COMMS, uid)
+    # A gamescope socket can outlive its compositor, so the process is the
+    # deciding signal; the socket is corroborating evidence only.
+    gaming = bool(gamescope)
+    display = {
+        "mode": "gaming" if gaming else "desktop",
+        "gamescope_processes": gamescope,
+        "desktop_processes": [
+            {**p, "desktop": _DESKTOP_COMMS[p["name"]]} for p in desktop
+        ],
+        "runtime_sockets": sockets,
+        "screenshot_and_input_tools_available": "yes" if gaming else "no",
+        "consequence": (
+            "screenshot/send_key/type_text/mouse_move_click work (gamescope is running)."
+            if gaming else
+            "screenshot/send_key/type_text/mouse_move_click will NOT work — "
+            "no gamescope process, this is Desktop Mode. Use steam_ui_eval / "
+            "steam_snippet instead, or ask the user to switch to Gaming Mode."
+        ),
+    }
+
+    # The MCP server is spawned by claude, so our own ancestry is claude's
+    # ancestry plus one hop.
+    chain = _ancestors(os.getpid())
+    loader = next((p for p in chain if p["name"] in _LOADER_COMMS), None)
+    claude = next((p for p in chain[1:] if p["name"] == "claude"), None)
+    unit = _proc_unit(claude["pid"] if claude else os.getpid())
+    inside = bool(loader) or unit == _LOADER_UNIT
+    origin = {
+        "inside_plugin": inside,
+        "claude_pid": claude["pid"] if claude else None,
+        "loader_pid": loader["pid"] if loader else None,
+        "systemd_unit": unit,
+        "ancestor_chain": " <- ".join(f"{p['name']}({p['pid']})" for p in chain),
+        "restarting_plugin_loader_kills_this_session": "yes" if inside else "no",
+        "consequence": (
+            "This session was launched by the decky-claude plugin. Restarting "
+            "plugin_loader.service (or killing PluginLoader) kills this session "
+            "instantly and it does NOT auto-resume — warn the user and make it "
+            "the very last step, or have them run it themselves."
+            if inside else
+            "This session is standalone (not under PluginLoader). Restarting "
+            "plugin_loader.service is safe for this session; only the plugin's "
+            "own sessions and the MCP tools' CEF connection are briefly affected."
+        ),
+    }
+    return {"display": display, "session_origin": origin}
+
+
+def _handle_session_context() -> list[dict]:
+    return [{"type": "text", "text": json.dumps(session_context(), indent=2, ensure_ascii=False)}]
+
+
+_DESKTOP_HINT = (
+    " Call session_context to check the live display mode — screen capture and "
+    "input only work in Gaming Mode (gamescope); in Desktop Mode use "
+    "steam_ui_eval / steam_snippet instead."
+)
+
+
 def _handle_screenshot() -> list[dict]:
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         path = f.name
@@ -342,7 +510,7 @@ def _handle_screenshot() -> list[dict]:
     if failure:
         if os.path.exists(path):
             os.unlink(path)
-        return [{"type": "text", "text": f"Screenshot failed — {failure}."}]
+        return [{"type": "text", "text": f"Screenshot failed — {failure}.{_DESKTOP_HINT}"}]
 
     with open(path, "rb") as f:
         data = base64.standard_b64encode(f.read()).decode()
@@ -350,18 +518,28 @@ def _handle_screenshot() -> list[dict]:
     return [{"type": "image", "data": data, "mimeType": "image/png"}]
 
 
+def _input_hint() -> str:
+    """Point a failed input call at session_context when Desktop Mode is the
+    likely reason; in Gaming Mode the failure is something else."""
+    try:
+        gaming = bool(_find_procs(_GAMESCOPE_COMMS, os.getuid()))
+    except OSError:
+        gaming = True
+    return "" if gaming else "." + _DESKTOP_HINT
+
+
 def _handle_send_key(key: str) -> list[dict]:
     rc, err, tool = _run_first(deck_common.key_commands(key))
     if rc == 0:
         return [{"type": "text", "text": f"Key sent: {key} ({tool})"}]
-    return [{"type": "text", "text": f"send_key failed for {key!r}: {err}"}]
+    return [{"type": "text", "text": f"send_key failed for {key!r}: {err}{_input_hint()}"}]
 
 
 def _handle_type_text(text: str) -> list[dict]:
     rc, err, tool = _run_first(deck_common.type_commands(text))
     if rc == 0:
         return [{"type": "text", "text": f"Typed: {text!r} ({tool})"}]
-    return [{"type": "text", "text": f"type_text failed: {err}"}]
+    return [{"type": "text", "text": f"type_text failed: {err}{_input_hint()}"}]
 
 
 def _handle_mouse_move_click(x: int, y: int, button: str = "left") -> list[dict]:
@@ -380,7 +558,7 @@ def _handle_mouse_move_click(x: int, y: int, button: str = "left") -> list[dict]
             return [{"type": "text", "text": (
                 f"Moved to ({x},{y}) and {button}-clicked ({move[0]})"
             )}]
-    return [{"type": "text", "text": f"mouse_move_click failed: {err}"}]
+    return [{"type": "text", "text": f"mouse_move_click failed: {err}{_input_hint()}"}]
 
 
 _MAX_EVAL_OUTPUT = 20000
@@ -615,6 +793,8 @@ def _dispatch(name: str, args: dict) -> list[dict]:
         return _handle_steam_ui_eval(_require_str(name, args, "expression"), target)
     if name == "steam_snippet":
         return _handle_steam_snippet(_require_str(name, args, "name"))
+    if name == "session_context":
+        return _handle_session_context()
     if name == "screenshot":
         return _handle_screenshot()
     if name == "send_key":

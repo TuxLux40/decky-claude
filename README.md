@@ -65,6 +65,16 @@ Everything injected into the working directory (`.mcp.json`, the `CLAUDE.md` blo
 | `send_key` | Key press to the focused window |
 | `type_text` | Type a string |
 | `mouse_move_click` | Move to (x, y) and click (1280×800 native) |
+| `session_context` | Live "where am I running" check (read-only, see below) |
+
+### `session_context`: where is this session running?
+
+Two facts change what Claude can safely do, and both can change mid-session:
+
+- **Display mode.** `gaming` if a `gamescope` / `gamescope-wl` process is running for the user, `desktop` otherwise. The process is the deciding signal; the `gamescope-N` socket is only reported as evidence, since a socket can outlive its compositor. `screenshot` and the input tools work only in `gaming`; in Desktop Mode use `steam_ui_eval` / `steam_snippet`.
+- **Session origin.** Whether the Claude process descends from Decky's `PluginLoader` (walked via `/proc/<pid>/stat`, with the systemd unit from `/proc/<pid>/cgroup` as a fallback). A session launched from the plugin **dies instantly when `plugin_loader.service` restarts and does not auto-resume**. A standalone terminal session that uses the same MCP server is unaffected.
+
+The tool returns JSON with the evidence (gamescope/desktop PIDs, runtime sockets, the ancestor chain, the systemd unit) plus a one-line consequence for each fact. The injected `CLAUDE.md` block tells Claude to call it before using screenshots or input, and before restarting the loader. The machine profile's mode line is marked as a snapshot from session start. When screenshots or input fail in Desktop Mode, the error message also points to this tool.
 
 ## Installation
 
