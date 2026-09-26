@@ -56,6 +56,25 @@ Steam Deck — Gaming Mode
 
 Everything injected into the working directory (`.mcp.json`, the `CLAUDE.md` block, the skill symlink) is removed again when you stop the session. `mcp_server.py` is stdlib-only Python — no pip dependencies, no daemon, no open ports; it lives only as a child of the Claude session.
 
+## How game input works (planned feature)
+
+A game never reads your physical controller directly. Steam creates a
+**virtual gamepad** for each connected controller, fills it with your button
+presses after applying your per-game controller config, and the game polls
+that virtual pad every frame.
+
+So for Claude to press buttons "as your controller", it doesn't need to fake
+your controller or talk to Steam through some API — it writes button events
+straight into Steam's virtual gamepad for your controller. The game can't tell
+them apart from your own presses, and no second controller or player-2 slot
+appears. Steam's own udev rules already allow this without root.
+
+Common misconceptions this clears up: Valve's *Steam Input API* is for games
+(a game asking Steam which actions are pressed), not for outside programs to
+send input; and creating a new virtual controller makes Steam see an *extra*
+controller rather than yours. Details, diagram and test results:
+[`docs/game-input.md`](docs/game-input.md).
+
 ## MCP tools
 
 | Tool | Purpose |
