@@ -176,7 +176,7 @@ plugin folder.
 4. Describe the problem ("downloads are stuck", "Steam won't stay logged in", "X crashes at the menu"). Claude loads the steam-debugger skill, inspects Steam from the inside, reads logs, screenshots the screen, and walks the fix with you.
 5. Stop the session from the panel when done — all injected config is cleaned up.
 
-The panel's **Screen Preview** section is for you, not Claude — Claude captures on its own via the `screenshot` MCP tool whenever it needs to see something. The panel's **Capture Screen** button gives you the same view without spinning up a session: useful to sanity-check the capture pipeline, or just to glance at the Deck's screen from the Quick Access menu. It works even with no session running. By default it captures the game/desktop frame only (same as the physical screenshot button); toggle **Include Steam UI** on to capture the Quick Access Menu / overlay instead. The panel also offers manual key/mouse/text input for when you want to poke the Deck yourself.
+Screenshots happen in the chat: Claude captures on its own via the `screenshot` MCP tool whenever it needs to see something. The panel's collapsible **Manual Input** section offers key/mouse/text input for when you want to poke the machine yourself.
 
 ## Repository layout
 

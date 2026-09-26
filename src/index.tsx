@@ -7,7 +7,6 @@ import {
   PanelSectionRow,
   staticClasses,
   TextField,
-  ToggleField,
 } from "@decky/ui";
 import { callable, definePlugin } from "@decky/api";
 import { useEffect, useMemo, useState } from "react";
@@ -35,12 +34,6 @@ const getStatus = callable<
   }
 >("get_status");
 const listDirs = callable<[], { dirs: string[] }>("list_dirs");
-
-const captureScreenshot = callable<
-  [boolean],
-  { success: boolean; path?: string; thumbnail?: string; error?: string }
->("capture_screenshot");
-const getScreenState = callable<[], { thumbnail: string | null }>("get_screen_state");
 
 const sendKey = callable<[string], { success: boolean; error?: string }>("send_key");
 const sendText = callable<[string], { success: boolean; error?: string }>("send_text");
@@ -167,7 +160,6 @@ function Content() {
   // kicked off, so isRunning can't be used to tell "starting" from "stopping".
   const [sessionAction, setSessionAction] = useState<"start" | "stop" | null>(null);
   const [sessionError, setSessionError] = useState<string | null>(null);
-  const [urlCopied, setUrlCopied] = useState(false);
   const [skill, setSkill] = useState<string | null>(null);
 
   // auth
@@ -184,15 +176,8 @@ function Content() {
   // "" = start a fresh session; otherwise the transcript id to resume
   const [resumeId, setResumeId] = useState("");
 
-  // screen
-  const [thumbnail, setThumbnail] = useState<string | null>(null);
-  const [captureLoading, setCaptureLoading] = useState(false);
-  const [captureError, setCaptureError] = useState<string | null>(null);
-  // gamescope excludes the Steam overlay (QAM, notifications) from a capture
-  // by default, same as the physical screenshot button — this opts in.
-  const [includeSteamUi, setIncludeSteamUi] = useState(false);
-
   // input
+  const [inputOpen, setInputOpen] = useState(false);
   const [typeText, setTypeText] = useState("");
   const [inputFeedback, setInputFeedback] = useState<{ msg: string; ok: boolean } | null>(null);
 
@@ -209,9 +194,6 @@ function Content() {
     syncStatus();
     syncAuth();
     syncMachineSessions();
-    getScreenState()
-      .then((r) => { if (r.thumbnail) setThumbnail(r.thumbnail); })
-      .catch(logPollFailure);
   }, []);
 
   useEffect(() => {
@@ -365,36 +347,6 @@ function Content() {
     }
   }
 
-  function copyUrl() {
-    if (!sessionUrl) return;
-    const el = document.createElement("textarea");
-    el.value = sessionUrl;
-    document.body.appendChild(el);
-    el.select();
-    document.execCommand("copy");
-    document.body.removeChild(el);
-    setUrlCopied(true);
-    setTimeout(() => setUrlCopied(false), 2000);
-  }
-
-  // ── screen ──
-  async function handleCapture() {
-    setCaptureLoading(true);
-    setCaptureError(null);
-    try {
-      const r = await captureScreenshot(includeSteamUi);
-      if (r.success && r.thumbnail) {
-        setThumbnail(r.thumbnail);
-      } else if (!r.success) {
-        setCaptureError(r.error ?? "Capture failed");
-      }
-    } catch (e) {
-      setCaptureError(errorText(e, "Capture failed"));
-    } finally {
-      setCaptureLoading(false);
-    }
-  }
-
   // ── input ──
   function showFeedback(msg: string, ok: boolean) {
     setInputFeedback({ msg, ok });
@@ -506,6 +458,10 @@ function Content() {
 
       {/* ── Remote Session ─────────────────────────────────────────────── */}
       <PanelSection title="Claude Code Remote">
+        {/* The QAM scrolls by following D-pad focus; without a focus target
+            up here, the status and URL above the first button can never be
+            scrolled back into view. */}
+        <Focusable onActivate={() => {}}>
         <PanelSectionRow>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <div
@@ -549,17 +505,14 @@ function Content() {
               </div>
             </PanelSectionRow>
             <PanelSectionRow>
-              <ButtonItem layout="below" onClick={copyUrl}>
-                {urlCopied ? "Copied!" : "Copy Session URL"}
-              </ButtonItem>
-            </PanelSectionRow>
-            <PanelSectionRow>
               <div style={{ fontSize: 11, color: "#aaa" }}>
                 Claude app → Code tab → connect. Claude will screenshot automatically when you ask about the game.
               </div>
             </PanelSectionRow>
           </>
         )}
+
+        </Focusable>
 
         {status === "starting" && !sessionUrl && (
           <PanelSectionRow>
@@ -655,54 +608,14 @@ function Content() {
         )}
       </PanelSection>
 
-      {/* ── Screen Preview ──────────────────────────────────────────────── */}
-      <PanelSection title="Screen Preview">
-        {thumbnail && (
-          <PanelSectionRow>
-            <img
-              src={`data:image/png;base64,${thumbnail}`}
-              style={{
-                width: "100%", borderRadius: 6, display: "block",
-                border: "1px solid rgba(255,255,255,0.1)",
-              }}
-              alt="Last capture"
-            />
-          </PanelSectionRow>
-        )}
-
-        <PanelSectionRow>
-          <ToggleField
-            label="Include Steam UI"
-            description="Also capture the Quick Access Menu / overlay, not just the game"
-            checked={includeSteamUi}
-            onChange={setIncludeSteamUi}
-          />
-        </PanelSectionRow>
-
-        <PanelSectionRow>
-          <ButtonItem layout="below" onClick={handleCapture} disabled={captureLoading}>
-            {captureLoading ? "Capturing…" : "Capture Screen"}
-          </ButtonItem>
-        </PanelSectionRow>
-
-        {captureError && (
-          <PanelSectionRow>
-            <div style={{ fontSize: 11, color: "#f44336" }}>{captureError}</div>
-          </PanelSectionRow>
-        )}
-
-        <PanelSectionRow>
-          <div style={{ fontSize: 11, color: "#555", lineHeight: 1.4 }}>
-            For your own preview — Claude captures on its own when you ask it
-            something. By default a capture is the game/desktop frame only,
-            same as the physical screenshot button; the overlay shown here
-            isn't part of it unless "Include Steam UI" is on.
-          </div>
-        </PanelSectionRow>
-      </PanelSection>
-
       {/* ── Manual Input ────────────────────────────────────────────────── */}
       <PanelSection title="Manual Input">
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={() => setInputOpen((o) => !o)}>
+            {inputOpen ? "Hide controls ▴" : "Show controls ▾"}
+          </ButtonItem>
+        </PanelSectionRow>
+        {inputOpen && (<>
         <PanelSectionRow>
           <div style={{
             fontSize: 11, color: "#f0a500",
@@ -772,6 +685,7 @@ function Content() {
             </div>
           </PanelSectionRow>
         )}
+        </>)}
       </PanelSection>
 
       <PanelSection title="Settings">

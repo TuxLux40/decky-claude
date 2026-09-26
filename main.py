@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import fcntl
 import glob
 import json
@@ -438,9 +437,6 @@ class Plugin:
     _login_proc: asyncio.subprocess.Process | None = None
     _login_fd: int | None = None
     _login_url: str | None = None
-
-    # ── screen state ───────────────────────────────────────────────────────────
-    _last_thumb_b64: str | None = None
 
     @staticmethod
     def _machine_md() -> str:
@@ -932,19 +928,6 @@ class Plugin:
             pass
         return {"dirs": dirs}
 
-    # ── screenshot API (for panel preview only) ────────────────────────────────
-
-    async def capture_screenshot(self, include_steam_ui: bool = False):
-        """Manual capture for the panel thumbnail — Claude uses the MCP tool instead."""
-        out_path = "/tmp/decky-claude-preview.png"
-        result = await self._take_screenshot(out_path, include_steam_ui)
-        if result["success"]:
-            self._last_thumb_b64 = await self._make_thumb(out_path)
-        return {**result, "thumbnail": self._last_thumb_b64}
-
-    async def get_screen_state(self):
-        return {"thumbnail": self._last_thumb_b64}
-
     # ── input API (manual controls in the panel) ───────────────────────────────
 
     async def send_key(self, key: str):
@@ -1228,66 +1211,6 @@ class Plugin:
         # Compositor variables are resolved in deck_common so this process and
         # mcp_server.py cannot disagree about which session they are driving.
         return deck_common.apply_display_env(env, _USER_UID)
-
-    # gamescopectl only forwards a single opaque string after the command
-    # name, so a screenshot type is smuggled in as a second whitespace
-    # -separated token — gamescope's own "screenshot" console command
-    # re-splits it into <path> <type> (see mcp_server.py for the full
-    # rationale and the screenshot_type enum). 4 = screen_buffer: the exact
-    # on-screen buffer, Steam overlay included. Unverified on hardware.
-    _SCREENSHOT_TYPE_SCREEN_BUFFER = 4
-
-    async def _take_screenshot(self, out_path: str, include_steam_ui: bool = False) -> dict:
-        env = self._display_env()
-        # This plugin targets Gaming Mode only, so capture goes through
-        # gamescope and nothing else. That is not a fallback among options: it
-        # is the same compositor-side capture the controller's screenshot
-        # button triggers (Steam sets GAMESCOPECTRL_REQUEST_SCREENSHOT and
-        # gamescope does the work), just addressed directly so the frame lands
-        # at a path we choose instead of in the user's Steam screenshot
-        # library. gamescope implements no Wayland screencopy protocol, so
-        # grim and friends cannot capture here regardless.
-        if not env.get("GAMESCOPE_WAYLAND_DISPLAY"):
-            return {
-                "success": False,
-                "error": "Not running under gamescope — screen capture needs Gaming Mode",
-            }
-
-        arg = (
-            f"{out_path} {self._SCREENSHOT_TYPE_SCREEN_BUFFER}"
-            if include_steam_ui
-            else out_path
-        )
-        # Outside a live gamescope, gamescopectl still exits 0 after failing to
-        # connect, so the file itself is the only trustworthy success signal.
-        r = await self._run_cmd(
-            ["gamescopectl", "screenshot", arg], env, timeout=15
-        )
-        if r["success"]:
-            # gamescope writes the file from its own render thread, so it can
-            # land slightly after the command returns.
-            for _ in range(20):
-                if os.path.exists(out_path) and os.path.getsize(out_path):
-                    return {"success": True, "path": out_path}
-                await asyncio.sleep(0.1)
-        return {
-            "success": False,
-            "error": r.get("error") or "gamescope produced no screenshot",
-        }
-
-    async def _make_thumb(self, src: str) -> str | None:
-        thumb = src.replace(".png", "_thumb.png")
-        # Downscale the frame we already have. (grim -s used to be tried first,
-        # but it re-captures rather than resizes and cannot run under gamescope
-        # anyway.) Falls through to the full-size image if convert is absent.
-        r = await self._run_cmd(["convert", "-resize", "30%", src, thumb])
-        if r["success"] and os.path.exists(thumb):
-            src = thumb
-        try:
-            with open(src, "rb") as f:
-                return base64.b64encode(f.read(512 * 1024)).decode()
-        except OSError:
-            return None
 
     async def _run_first(self, cmds: list[list[str]]) -> dict:
         """Run the xdotool/ydotool alternatives until one succeeds, reporting
