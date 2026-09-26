@@ -227,15 +227,17 @@ def _installed_version() -> str:
 
 
 def _version_tuple(v: str) -> tuple[int, ...]:
-    """'v1.2.3' / '1.2.3-rc1' -> (1, 2, 3). Unparseable parts count as 0."""
-    core = v.strip().lstrip("vV").split("-", 1)[0].split("+", 1)[0]
+    """'v1.2.3' -> (1, 2, 3, 1); '1.2.3-dev.4' -> (1, 2, 3, 0), so a branch
+    pre-release sorts below its release. Unparseable parts count as 0."""
+    plain = v.strip().lstrip("vV").split("+", 1)[0]
+    core, _, pre = plain.partition("-")
     out = []
     for part in core.split("."):
         m = re.match(r"\d+", part)
         out.append(int(m.group(0)) if m else 0)
     while len(out) < 3:
         out.append(0)
-    return tuple(out)
+    return (*out[:3], 0 if pre else 1)
 
 
 def _ssl_context():
