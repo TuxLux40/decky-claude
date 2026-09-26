@@ -16,6 +16,15 @@ on:
       - main
     tags:
       - "v*"
+    # Pushes touching only these don't change the shipped plugin, so they
+    # don't release (tag pushes ignore path filters and always release).
+    paths-ignore:
+      - "README.md"
+      - "CLAUDE.md"
+      - "docs/**"
+      - "scripts/prototypes/**"
+      - "assets/**"
+      - ".github/**"
   workflow_dispatch:
 
 permissions:
