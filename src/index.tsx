@@ -13,6 +13,7 @@ import { callable, definePlugin } from "@decky/api";
 import { useEffect, useMemo, useState } from "react";
 import { FaTerminal } from "react-icons/fa";
 import qrcode from "qrcode-generator";
+import { startAutoUpdate, UpdateSection } from "./update";
 
 // ── backend callables ──────────────────────────────────────────────────────────
 
@@ -842,16 +843,24 @@ function Content() {
           </PanelSectionRow>
         )}
       </PanelSection>
+
+      {/* ── Plugin Updates (see update.tsx) ─────────────────────────────── */}
+      <UpdateSection />
     </>
   );
 }
 
 // ── plugin entry ───────────────────────────────────────────────────────────────
 
-export default definePlugin(() => ({
-  name: "Claude Code",
-  title: <div className={staticClasses.Title}>Claude Code</div>,
-  icon: <FaTerminal />,
-  content: <Content />,
-  onDismount() {},
-}));
+export default definePlugin(() => {
+  const stopAutoUpdate = startAutoUpdate();
+  return {
+    name: "Claude Code",
+    title: <div className={staticClasses.Title}>Claude Code</div>,
+    icon: <FaTerminal />,
+    content: <Content />,
+    onDismount() {
+      stopAutoUpdate();
+    },
+  };
+});

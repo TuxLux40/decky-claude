@@ -158,6 +158,256 @@ likely on their phone, and may not be able to read long output comfortably.
 """
 
 
+# ── self-update ────────────────────────────────────────────────────────────────
+# The plugin is not in the Decky store, so Decky never tells anyone a new
+# version exists. We ask GitHub for the latest release ourselves; the actual
+# install is handed to Decky's own installer by the frontend
+# (utilities/install_plugin), exactly the path the store uses. Nothing here
+# writes plugin files.
+
+_UPDATE_REPO = "TuxLux40/decky-claude"
+_UPDATE_API = f"https://api.github.com/repos/{_UPDATE_REPO}/releases/latest"
+_UPDATE_ASSET = "decky-claude.zip"
+_UPDATE_TTL = 6 * 3600       # a successful check is good for this long
+_UPDATE_RETRY = 15 * 60      # back off this long after a failed check
+_SHA256_RE = re.compile(r"\b[0-9a-fA-F]{64}\b")
+
+
+def _plugin_setting_dir(env_key: str, fallback: str) -> str:
+    path = os.environ.get(env_key) or os.path.join(
+        _USER_HOME, "homebrew", fallback, "decky-claude"
+    )
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _settings_path() -> str:
+    # Decky keeps DECKY_PLUGIN_SETTINGS_DIR across reinstalls/updates (only the
+    # plugin directory is replaced), so this survives the updates it enables.
+    return os.path.join(_plugin_setting_dir("DECKY_PLUGIN_SETTINGS_DIR", "settings"), "settings.json")
+
+
+def _load_settings() -> dict:
+    try:
+        with open(_settings_path()) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_setting(key: str, value) -> None:
+    """Read-modify-write so keys owned by other features are preserved."""
+    data = _load_settings()
+    data[key] = value
+    path = _settings_path()
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def _installed_version() -> str:
+    try:
+        with open(os.path.join(_PLUGIN_DIR, "package.json")) as f:
+            return str(json.load(f).get("version") or "0.0.0")
+    except (OSError, ValueError):
+        return os.environ.get("DECKY_PLUGIN_VERSION", "0.0.0")
+
+
+def _version_tuple(v: str) -> tuple[int, ...]:
+    """'v1.2.3' / '1.2.3-rc1' -> (1, 2, 3). Unparseable parts count as 0."""
+    core = v.strip().lstrip("vV").split("-", 1)[0].split("+", 1)[0]
+    out = []
+    for part in core.split("."):
+        m = re.match(r"\d+", part)
+        out.append(int(m.group(0)) if m else 0)
+    while len(out) < 3:
+        out.append(0)
+    return tuple(out)
+
+
+def _ssl_context():
+    import ssl
+
+    # Decky's bundled Python may not find the distro CA store on its own;
+    # certifi ships with it (aiohttp depends on it), then fall back to the
+    # usual system bundle locations.
+    try:
+        import certifi  # type: ignore
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        pass
+    for cafile in (
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/cert.pem",
+    ):
+        if os.path.isfile(cafile):
+            try:
+                return ssl.create_default_context(cafile=cafile)
+            except Exception:
+                continue
+    return ssl.create_default_context()
+
+
+def _http_get(url: str, headers: dict | None = None, timeout: float = 10):
+    """Blocking GET -> (status, headers, body). 304 is returned, not raised."""
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "decky-claude-updater",
+        **(headers or {}),
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
+            return resp.status, dict(resp.headers), resp.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304:
+            return 304, dict(exc.headers or {}), b""
+        raise
+
+
+def _parse_release(data: dict, sha_fetcher) -> dict:
+    tag = str(data.get("tag_name") or "")
+    asset = next(
+        (a for a in data.get("assets") or [] if a.get("name") == _UPDATE_ASSET), None
+    )
+    if not tag or not asset:
+        raise ValueError(f"latest release {tag or '?'} has no {_UPDATE_ASSET}")
+    # GitHub reports "digest": "sha256:<hex>" on assets; the CI also publishes
+    # a .sha256 asset as a fallback for older API responses.
+    digest = str(asset.get("digest") or "")
+    sha = digest.split(":", 1)[1] if digest.startswith("sha256:") else ""
+    if not sha:
+        sha_asset = next(
+            (a for a in data.get("assets") or []
+             if a.get("name") == _UPDATE_ASSET + ".sha256"),
+            None,
+        )
+        if sha_asset:
+            m = _SHA256_RE.search(sha_fetcher(sha_asset["browser_download_url"]))
+            sha = m.group(0) if m else ""
+    return {
+        "tag": tag,
+        "version": tag.lstrip("vV"),
+        "artifact": asset["browser_download_url"],
+        "hash": sha.lower(),
+        "url": data.get("html_url") or "",
+        "published_at": data.get("published_at") or "",
+    }
+
+
+def _fetch_latest_release(etag: str) -> tuple[dict | None, str]:
+    """Blocking. Returns (release or None if unchanged, new etag)."""
+    headers = {"Accept": "application/vnd.github+json"}
+    if etag:
+        # Conditional requests answered with 304 don't count against the
+        # 60/h unauthenticated rate limit.
+        headers["If-None-Match"] = etag
+    status, resp_headers, body = _http_get(_UPDATE_API, headers)
+    new_etag = resp_headers.get("ETag") or resp_headers.get("Etag") or ""
+    if status == 304:
+        return None, new_etag or etag
+    release = _parse_release(
+        json.loads(body),
+        lambda url: _http_get(url)[2].decode("utf-8", errors="replace"),
+    )
+    return release, new_etag
+
+
+class _Updater:
+    """Cached, non-blocking latest-release lookup."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._cache: dict = {}
+        self._error: str | None = None
+        self._error_at = 0.0
+        self._loaded = False
+
+    @staticmethod
+    def _cache_path() -> str:
+        return os.path.join(_plugin_setting_dir("DECKY_PLUGIN_RUNTIME_DIR", "data"), "update_cache.json")
+
+    def _load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        try:
+            with open(self._cache_path()) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self._cache = data
+        except (OSError, ValueError):
+            pass
+
+    def _store(self) -> None:
+        try:
+            with open(self._cache_path(), "w") as f:
+                json.dump(self._cache, f)
+        except OSError:
+            logger.warning("could not persist update cache", exc_info=True)
+
+    async def latest(self, force: bool = False) -> tuple[dict | None, str | None]:
+        import time
+
+        async with self._lock:
+            self._load()
+            now = time.time()
+            fresh = now - float(self._cache.get("checked_at") or 0) < _UPDATE_TTL
+            backing_off = now - self._error_at < _UPDATE_RETRY
+            if not force and (fresh or backing_off):
+                return self._cache.get("release"), self._error
+            try:
+                release, etag = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _fetch_latest_release,
+                        self._cache.get("etag", "") if self._cache.get("release") else "",
+                    ),
+                    timeout=30,
+                )
+            except Exception as exc:
+                import urllib.error
+
+                if isinstance(exc, urllib.error.HTTPError) and exc.code in (403, 429):
+                    msg = "GitHub rate limit reached, will retry later"
+                elif isinstance(exc, urllib.error.HTTPError) and exc.code == 404:
+                    msg = "No release published yet"
+                elif isinstance(exc, (urllib.error.URLError, OSError, asyncio.TimeoutError)):
+                    msg = "Offline or GitHub unreachable"
+                else:
+                    msg = f"Update check failed: {exc}"
+                logger.info("update check: %s (%r)", msg, exc)
+                self._error, self._error_at = msg, now
+                return self._cache.get("release"), self._error
+            if release is not None:
+                self._cache["release"] = release
+            self._cache["etag"] = etag
+            self._cache["checked_at"] = now
+            self._error, self._error_at = None, 0.0
+            self._store()
+            return self._cache.get("release"), None
+
+    def checked_at(self) -> float:
+        return float(self._cache.get("checked_at") or 0)
+
+
+_updater: _Updater | None = None
+
+
+def _get_updater() -> _Updater:
+    # Created lazily so its asyncio.Lock binds to Decky's running loop.
+    global _updater
+    if _updater is None:
+        _updater = _Updater()
+    return _updater
+
+# ── end self-update ────────────────────────────────────────────────────────────
+
+
 class Plugin:
     # ── session state ──────────────────────────────────────────────────────────
     _process: asyncio.subprocess.Process | None = None
@@ -1145,3 +1395,40 @@ class Plugin:
         finally:
             if self._status == "running":
                 self._status = "stopped"
+
+    # ── self-update API ────────────────────────────────────────────────────────
+    # See the "self-update" block above the class. The frontend performs the
+    # install through Decky's utilities/install_plugin; we only report.
+
+    async def get_update_info(self, force: bool = False):
+        release, error = await _get_updater().latest(force=bool(force))
+        current = _installed_version()
+        available = bool(
+            release
+            and release.get("hash")
+            and _version_tuple(release["version"]) > _version_tuple(current)
+        )
+        if release and not release.get("hash") and not error:
+            error = "Latest release has no sha256; refusing to install it"
+        return {
+            "current": current,
+            "latest": release.get("version") if release else None,
+            "update_available": available,
+            "artifact": release.get("artifact") if release else None,
+            "hash": release.get("hash") if release else None,
+            "release_url": release.get("url") if release else None,
+            "checked_at": _get_updater().checked_at(),
+            "error": error,
+            "auto_update": bool(_load_settings().get("auto_update", True)),
+            # Decky uninstalls the old copy first, which unloads this backend
+            # and would end a live session — the frontend won't auto-install
+            # while this is true.
+            "session_active": self._status in ("starting", "running"),
+        }
+
+    async def set_auto_update(self, enabled: bool):
+        try:
+            _save_setting("auto_update", bool(enabled))
+            return {"success": True, "auto_update": bool(enabled)}
+        except OSError as exc:
+            return {"success": False, "error": str(exc)}
