@@ -85,17 +85,6 @@ The tool returns the evidence (processes, sockets, the process ancestry, the sys
 
 </details>
 
-<details>
-<summary><b>How game input works</b> (planned feature)</summary>
-
-A game never reads your physical controller directly. Steam creates a **virtual gamepad** for each connected controller, fills it with your presses after applying your per-game controller config, and the game polls that virtual pad every frame.
-
-So for Claude to press buttons *as your controller*, it doesn't fake your controller or call some Steam API — it writes button events straight into Steam's virtual gamepad for your controller. The game can't tell them apart from your own presses, no second controller or player-2 slot appears, and Steam's own udev rules already allow it without root.
-
-This also clears up two common misconceptions: Valve's *Steam Input API* is for games (a game asking Steam which actions are pressed), not for outside programs to send input; and creating a new virtual controller makes Steam see an *extra* controller rather than yours. Details, diagram and test results: [`docs/game-input.md`](docs/game-input.md).
-
-</details>
-
 ## Installation
 
 > [!IMPORTANT]
@@ -127,7 +116,7 @@ These use `xdotool` (primary) and `ydotool` (fallback for pure-Wayland sessions)
 ./scripts/setup-input-tools.sh
 ```
 
-A dependency-free replacement that injects input through Steam's own virtual controller is being researched — see [How game input works](docs/game-input.md) and [#16](https://github.com/TuxLux40/decky-claude/pull/16).
+A dependency-free replacement that injects input through Steam's own virtual controller is being researched — see [`feat/game-input`](https://github.com/TuxLux40/decky-claude/tree/feat/game-input).
 
 </details>
 
@@ -192,7 +181,7 @@ Copy `dist/`, `skills/`, `main.py`, `mcp_server.py`, `deck_common.py`, `machine_
 
 **In progress**
 
-- [ ] **Game input through Steam's virtual controller** — press buttons on your own controller's slot, no extra tools or root ([#16](https://github.com/TuxLux40/decky-claude/pull/16), [how it works](docs/game-input.md))
+- [ ] **Game input through Steam's virtual controller** — press buttons on your own controller's slot, no extra tools or root ([`feat/game-input`](https://github.com/TuxLux40/decky-claude/tree/feat/game-input))
 
 **Planned**
 
