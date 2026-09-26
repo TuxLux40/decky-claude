@@ -35,7 +35,7 @@ const getStatus = callable<
 const listDirs = callable<[], { dirs: string[] }>("list_dirs");
 
 const captureScreenshot = callable<
-  [],
+  [boolean],
   { success: boolean; path?: string; thumbnail?: string; error?: string }
 >("capture_screenshot");
 const getScreenState = callable<[], { thumbnail: string | null }>("get_screen_state");
@@ -186,6 +186,9 @@ function Content() {
   const [thumbnail, setThumbnail] = useState<string | null>(null);
   const [captureLoading, setCaptureLoading] = useState(false);
   const [captureError, setCaptureError] = useState<string | null>(null);
+  // gamescope excludes the Steam overlay (QAM, notifications) from a capture
+  // by default, same as the physical screenshot button — this opts in.
+  const [includeSteamUi, setIncludeSteamUi] = useState(false);
 
   // input
   const [typeText, setTypeText] = useState("");
@@ -377,7 +380,7 @@ function Content() {
     setCaptureLoading(true);
     setCaptureError(null);
     try {
-      const r = await captureScreenshot();
+      const r = await captureScreenshot(includeSteamUi);
       if (r.success && r.thumbnail) {
         setThumbnail(r.thumbnail);
       } else if (!r.success) {
@@ -752,6 +755,15 @@ function Content() {
         )}
 
         <PanelSectionRow>
+          <ToggleField
+            label="Include Steam UI"
+            description="Also capture the Quick Access Menu / overlay, not just the game"
+            checked={includeSteamUi}
+            onChange={setIncludeSteamUi}
+          />
+        </PanelSectionRow>
+
+        <PanelSectionRow>
           <ButtonItem layout="below" onClick={handleCapture} disabled={captureLoading}>
             {captureLoading ? "Capturing…" : "Capture Screen"}
           </ButtonItem>
@@ -764,8 +776,11 @@ function Content() {
         )}
 
         <PanelSectionRow>
-          <div style={{ fontSize: 11, color: "#555" }}>
-            Claude captures automatically when you message it. This button is for your own preview.
+          <div style={{ fontSize: 11, color: "#555", lineHeight: 1.4 }}>
+            For your own preview — Claude captures on its own when you ask it
+            something. By default a capture is the game/desktop frame only,
+            same as the physical screenshot button; the overlay shown here
+            isn't part of it unless "Include Steam UI" is on.
           </div>
         </PanelSectionRow>
       </PanelSection>
