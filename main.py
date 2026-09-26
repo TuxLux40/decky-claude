@@ -135,8 +135,11 @@ likely on their phone, and may not be able to read long output comfortably.
   via the Chrome DevTools Protocol. `SharedJSContext` hosts the `SteamClient`
   API — inspect Steam's real state and trigger real actions instead of
   clicking pixels.
-- **screenshot** — Capture the current display (Steam UI, game, error dialog).
-  Returns a PNG image so you can see exactly what the user sees.
+- **screenshot** — Capture the current display. Returns a PNG image. By
+  default this is the game/desktop frame only (same as the controller's
+  screenshot button) — the Steam overlay (Quick Access Menu, notifications)
+  is excluded. Pass `include_steam_ui: true` when the QAM or an overlay
+  dialog itself is what needs to be seen.
 - **send_key** — Send a key press to the focused window
   (e.g. `escape`, `Return`, `space`, `Tab`, `F1`, `ctrl+c`).
 - **type_text** — Type a string into the focused window.
@@ -672,10 +675,10 @@ class Plugin:
 
     # ── screenshot API (for panel preview only) ────────────────────────────────
 
-    async def capture_screenshot(self):
+    async def capture_screenshot(self, include_steam_ui: bool = False):
         """Manual capture for the panel thumbnail — Claude uses the MCP tool instead."""
         out_path = "/tmp/decky-claude-preview.png"
-        result = await self._take_screenshot(out_path)
+        result = await self._take_screenshot(out_path, include_steam_ui)
         if result["success"]:
             self._last_thumb_b64 = await self._make_thumb(out_path)
         return {**result, "thumbnail": self._last_thumb_b64}
@@ -967,7 +970,15 @@ class Plugin:
         # mcp_server.py cannot disagree about which session they are driving.
         return deck_common.apply_display_env(env, _USER_UID)
 
-    async def _take_screenshot(self, out_path: str) -> dict:
+    # gamescopectl only forwards a single opaque string after the command
+    # name, so a screenshot type is smuggled in as a second whitespace
+    # -separated token — gamescope's own "screenshot" console command
+    # re-splits it into <path> <type> (see mcp_server.py for the full
+    # rationale and the screenshot_type enum). 4 = screen_buffer: the exact
+    # on-screen buffer, Steam overlay included. Unverified on hardware.
+    _SCREENSHOT_TYPE_SCREEN_BUFFER = 4
+
+    async def _take_screenshot(self, out_path: str, include_steam_ui: bool = False) -> dict:
         env = self._display_env()
         # This plugin targets Gaming Mode only, so capture goes through
         # gamescope and nothing else. That is not a fallback among options: it
@@ -983,10 +994,15 @@ class Plugin:
                 "error": "Not running under gamescope — screen capture needs Gaming Mode",
             }
 
+        arg = (
+            f"{out_path} {self._SCREENSHOT_TYPE_SCREEN_BUFFER}"
+            if include_steam_ui
+            else out_path
+        )
         # Outside a live gamescope, gamescopectl still exits 0 after failing to
         # connect, so the file itself is the only trustworthy success signal.
         r = await self._run_cmd(
-            ["gamescopectl", "screenshot", out_path], env, timeout=15
+            ["gamescopectl", "screenshot", arg], env, timeout=15
         )
         if r["success"]:
             # gamescope writes the file from its own render thread, so it can
