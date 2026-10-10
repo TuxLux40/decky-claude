@@ -37,7 +37,11 @@ def _become_controlling_tty():
     fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
 _ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-_URL_PATTERN = re.compile(r"https://claude\.ai/code/session_[A-Za-z0-9_-]+")
+_SESSION_URL_BASE = "https://claude.ai/code/"
+# Fallback only. The TUI redraws by skipping cells that already hold the right
+# character, so after stripping escapes a printed URL can lose letters (seen:
+# "claude.ai/cde/session_…"). Match loosely and rebuild from the id.
+_URL_PATTERN = re.compile(r"https://claude\.ai/\S{0,12}?(session_[A-Za-z0-9]+)")
 # `claude auth login` prints its OAuth URL wrapped in an OSC-8 hyperlink, so
 # stop at ESC/BEL/] rather than whitespace.
 _OAUTH_URL = re.compile(r"https://[^\s\x1b\x07\]]*/oauth/[^\s\x1b\x07\]]+")
@@ -568,6 +572,7 @@ class Plugin:
         asyncio.ensure_future(self._drain_output())
 
         for _ in range(90):
+            self._adopt_session_from_state()
             if self._session_url:
                 self._status = "running"
                 self._error_msg = None
@@ -1344,18 +1349,40 @@ class Plugin:
     def _adopt_session_url(self, text: str) -> None:
         """Pull a remote-control URL out of CLI output if we don't have one yet.
 
-        The TUI wraps with ``\\r`` and often omits a trailing newline, so this
-        has to search the full decoded buffer, not only newline-split lines.
-        Finding a URL means the session started — any earlier banner line that
-        looked like an error (MCP auth notices contain the substring "auth")
-        was not fatal and must not stay stuck in the QAM.
+        Only a fallback for _adopt_session_from_state(): the TUI's diff
+        rendering can drop characters from what it prints, so the id is taken
+        from the match and the URL rebuilt rather than copied.
         """
         if self._session_url:
             return
         match = _URL_PATTERN.search(text)
         if not match:
             return
-        self._session_url = match.group(0)
+        self._set_session_url(_SESSION_URL_BASE + match.group(1))
+
+    def _adopt_session_from_state(self) -> None:
+        """Read the remote-control session id claude records for its pid.
+
+        claude keeps ~/.claude/sessions/<pid>.json up to date, including
+        ``bridgeSessionId`` once remote control is connected. Unlike the
+        rendered TUI, this is exact.
+        """
+        if self._session_url or not self._process:
+            return
+        path = os.path.join(_USER_HOME, ".claude", "sessions", f"{self._process.pid}.json")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                bridge = json.load(fh).get("bridgeSessionId")
+        except (OSError, ValueError):
+            return
+        if isinstance(bridge, str) and bridge.startswith("session_"):
+            self._set_session_url(_SESSION_URL_BASE + bridge)
+
+    def _set_session_url(self, url: str) -> None:
+        """Finding a URL means the session started — any earlier banner line
+        that looked like an error (MCP auth notices contain the substring
+        "auth") was not fatal and must not stay stuck in the QAM."""
+        self._session_url = url
         if self._status == "starting":
             self._status = "running"
         self._error_msg = None
