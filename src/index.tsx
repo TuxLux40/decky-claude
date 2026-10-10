@@ -318,6 +318,8 @@ function Content() {
       } else {
         setStatus("error");
         setSessionError(r.error ?? "Failed to start session");
+        // A logged-out CLI is the usual cause; re-check so the login section shows.
+        syncAuth();
       }
     } catch (e) {
       setStatus("error");
