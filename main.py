@@ -48,6 +48,10 @@ _RESUME_PROMPT = re.compile(
     r"Resume from summary \(recommended\)|Resuming the full session will consume",
     re.I,
 )
+# A logged-out CLI keeps the TUI open with this footer instead of exiting, so
+# without it the panel waited out the timeout and then claimed "running".
+# The TUI positions words with cursor moves, so stripped output has no spaces.
+_NOT_LOGGED_IN = re.compile(r"Not\s*logged\s*in", re.I)
 
 # Sentinel used to mark the block we inject into CLAUDE.md
 _MD_START = "<!-- decky-claude-start -->"
@@ -438,6 +442,7 @@ class Plugin:
     _resume_id: str = ""
     _session_id: str = ""
     _error_msg: str | None = None
+    _not_logged_in: bool = False
     _log_lines: list[str] = []
     _skill_name: str | None = None
     _skill_link_created: str | None = None
@@ -491,6 +496,7 @@ class Plugin:
         self._resume_id = resume_id
         self._session_url = None
         self._error_msg = None
+        self._not_logged_in = False
         self._status = "starting"
         self._log_lines = []
 
@@ -561,24 +567,35 @@ class Plugin:
 
         asyncio.ensure_future(self._drain_output())
 
-        for _ in range(40):
+        for _ in range(90):
             if self._session_url:
                 self._status = "running"
                 self._error_msg = None
                 return {"success": True, "url": self._session_url}
+            if self._not_logged_in:
+                return await self._fail_start(
+                    "Claude is logged out on this PC. Log in again above, "
+                    "then start the session."
+                )
             if self._process.returncode is not None:
                 self._status = "error"
                 self._error_msg = "Process exited before providing a session URL"
                 return {"success": False, "error": self._error_msg}
             await asyncio.sleep(0.5)
 
-        if self._process.returncode is None:
-            self._status = "running"
-            return {"success": True, "url": self._session_url}
+        # Without a URL the session never registered with claude.ai, so it
+        # would not show up in the app. Reporting "running" here hid that.
+        last = self._log_lines[-1] if self._log_lines else "no output"
+        return await self._fail_start(
+            "The session did not connect to claude.ai within 45 seconds, so it "
+            f"would not show up in the Claude app. Last output: {last}"
+        )
 
+    async def _fail_start(self, message: str) -> dict:
+        await self.stop_session()
         self._status = "error"
-        self._error_msg = "Timed out waiting for session URL"
-        return {"success": False, "error": self._error_msg}
+        self._error_msg = message
+        return {"success": False, "error": message}
 
     async def stop_session(self):
         if self._process:
@@ -1362,6 +1379,8 @@ class Plugin:
                 # return (no newline yet) is still picked up.
                 decoded = _ANSI_ESCAPE.sub("", buf.decode("utf-8", errors="replace"))
                 self._adopt_session_url(decoded)
+                if not self._session_url and _NOT_LOGGED_IN.search(decoded):
+                    self._not_logged_in = True
                 if (
                     not answered_resume_prompt
                     and self._resume_id
