@@ -113,6 +113,32 @@ function relativeTime(epochSeconds: number): string {
   return `${Math.floor(mins / 60 / 24)}d ago`;
 }
 
+// The panel's picks live outside the component. Steam remounts the panel while
+// its dropdowns are in use (Steam's log shows a fresh mount burst after each
+// pick), and component state reset the session choice to "New session"
+// before Start was pressed. Mounted panels subscribe, so a pick that lands on
+// an unmounted instance still reaches the one on screen.
+type Choice = "resumeId" | "workingDir";
+const choices: Record<Choice, string> = { resumeId: "", workingDir: "" };
+const choiceListeners = new Set<() => void>();
+
+function useChoice(key: Choice): [string, (next: string | ((cur: string) => string)) => void] {
+  const [value, setValue] = useState(choices[key]);
+  useEffect(() => {
+    const l = () => setValue(choices[key]);
+    choiceListeners.add(l);
+    l();
+    return () => {
+      choiceListeners.delete(l);
+    };
+  }, [key]);
+  const set = (next: string | ((cur: string) => string)) => {
+    choices[key] = typeof next === "function" ? next(choices[key]) : next;
+    choiceListeners.forEach((l) => l());
+  };
+  return [value, set];
+}
+
 /** QR as a single scaled bitmap.
  *
  *  An OAuth URL is ~450 chars, which needs a 73x73 matrix — rendering that as
@@ -152,7 +178,7 @@ function Content() {
   // session
   const [status, setStatus] = useState<SessionStatus>("stopped");
   const [sessionUrl, setSessionUrl] = useState<string | null>(null);
-  const [workingDir, setWorkingDir] = useState("");
+  const [workingDir, setWorkingDir] = useChoice("workingDir");
   const [dirs, setDirs] = useState<string[]>([]);
   const [sessionLoading, setSessionLoading] = useState(false);
   // Which action sessionLoading is for — `status` flips to "starting"
@@ -174,7 +200,7 @@ function Content() {
   // other sessions on this machine
   const [machineSessions, setMachineSessions] = useState<MachineSession[]>([]);
   // "" = start a fresh session; otherwise the transcript id to resume
-  const [resumeId, setResumeId] = useState("");
+  const [resumeId, setResumeId] = useChoice("resumeId");
 
   // input
   const [inputOpen, setInputOpen] = useState(false);
