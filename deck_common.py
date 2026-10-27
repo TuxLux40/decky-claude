@@ -12,6 +12,8 @@ by `claude` as a bare `python3` child with no virtualenv.
 """
 
 import os
+import re
+import subprocess
 
 # ── display environment ────────────────────────────────────────────────────────
 
@@ -42,6 +44,64 @@ def apply_display_env(env: dict[str, str], uid: int | None = None) -> dict[str, 
                 env.setdefault("WAYLAND_DISPLAY", wd)
                 break
     env.setdefault("DISPLAY", ":0")
+    return env
+
+
+def _xprop(env: dict[str, str], display: str, *args: str) -> str:
+    try:
+        r = subprocess.run(
+            ["xprop", "-display", display, *args],
+            env=env, capture_output=True, timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return r.stdout.decode(errors="replace") if r.returncode == 0 else ""
+
+
+def _cardinal(xprop_out: str, atom: str) -> str | None:
+    """First value of `ATOM(CARDINAL) = n, ...`; None when the atom is unset."""
+    m = re.search(rf"^{atom}\(CARDINAL\) = (\d+)", xprop_out, re.MULTILINE)
+    return m.group(1) if m else None
+
+
+def focused_x_display(env: dict[str, str]) -> str | None:
+    """The Xwayland display holding gamescope's focused window, if it can be found.
+
+    Gamescope runs one Xwayland server per client group: Steam sits on :0, but
+    a game is often on :1. xdotool only reaches the server named by DISPLAY,
+    so input sent to :0 while a game on :1 has focus moves an invisible cursor
+    and types into Steam's hidden window — it exits 0 and nothing happens.
+
+    Gamescope publishes its focus on :0's root window. Window ids are only
+    unique per server, so the focused id is matched together with its
+    STEAM_GAME appid to pick the right display.
+    """
+    base = env.get("DISPLAY", ":0")
+    root = _xprop(env, base, "-root", "GAMESCOPE_FOCUSED_WINDOW", "GAMESCOPE_FOCUSED_APP")
+    window = _cardinal(root, "GAMESCOPE_FOCUSED_WINDOW")
+    app = _cardinal(root, "GAMESCOPE_FOCUSED_APP")
+    if not window or not app:
+        return None
+    try:
+        sockets = sorted(os.listdir("/tmp/.X11-unix"))
+    except OSError:
+        return None
+    for sock in sockets:
+        if not re.fullmatch(r"X\d+", sock):
+            continue
+        display = f":{sock[1:]}"
+        props = _xprop(env, display, "-id", window, "STEAM_GAME")
+        if _cardinal(props, "STEAM_GAME") == app:
+            return display
+    return None
+
+
+def input_env(env: dict[str, str]) -> dict[str, str]:
+    """Copy of `env` with DISPLAY on the focused window's server (see above)."""
+    env = dict(env)
+    display = focused_x_display(env)
+    if display:
+        env["DISPLAY"] = display
     return env
 
 
