@@ -33,8 +33,8 @@ CEF_PORT = int(os.environ.get("DECKY_CLAUDE_CEF_PORT", "8080"))
 def _display_env() -> dict[str, str]:
     return deck_common.apply_display_env(dict(os.environ))
 
-def _run(cmd: list[str], timeout: float = 10) -> tuple[int, str]:
-    env = _display_env()
+def _run(cmd: list[str], timeout: float = 10, env: dict[str, str] | None = None) -> tuple[int, str]:
+    env = env or _display_env()
     try:
         r = subprocess.run(cmd, env=env, capture_output=True, timeout=timeout)
         return r.returncode, r.stderr.decode(errors="replace").strip()
@@ -326,12 +326,12 @@ def _register_snippet_tool() -> None:
 # ── tool handlers ──────────────────────────────────────────────────────────────
 
 
-def _run_first(cmds: list[list[str]]) -> tuple[int, str, str]:
+def _run_first(cmds: list[list[str]], env: dict[str, str] | None = None) -> tuple[int, str, str]:
     """Run each command until one succeeds; returns (rc, stderr, tool name)."""
     rc, err, tool = 1, "no command to run", ""
     for cmd in cmds:
         tool = cmd[0]
-        rc, err = _run(cmd)
+        rc, err = _run(cmd, env=env)
         if rc == 0:
             break
     return rc, err, tool
@@ -564,15 +564,20 @@ def _input_hint() -> str:
     return "" if gaming else "." + _DESKTOP_HINT
 
 
+def _input_env() -> dict[str, str]:
+    """Display environment aimed at the focused window's Xwayland server."""
+    return deck_common.input_env(_display_env())
+
+
 def _handle_send_key(key: str) -> list[dict]:
-    rc, err, tool = _run_first(deck_common.key_commands(key))
+    rc, err, tool = _run_first(deck_common.key_commands(key), _input_env())
     if rc == 0:
         return [{"type": "text", "text": f"Key sent: {key} ({tool})"}]
     return [{"type": "text", "text": f"send_key failed for {key!r}: {err}{_input_hint()}"}]
 
 
 def _handle_type_text(text: str) -> list[dict]:
-    rc, err, tool = _run_first(deck_common.type_commands(text))
+    rc, err, tool = _run_first(deck_common.type_commands(text), _input_env())
     if rc == 0:
         return [{"type": "text", "text": f"Typed: {text!r} ({tool})"}]
     return [{"type": "text", "text": f"type_text failed: {err}{_input_hint()}"}]
@@ -584,12 +589,13 @@ def _handle_mouse_move_click(x: int, y: int, button: str = "left") -> list[dict]
     # a move that lands with the other backend's click would move twice.
     moves = deck_common.mouse_move_commands(x, y)
     clicks = deck_common.click_commands(button)
+    env = _input_env()
     err = "no input tool available"
     for move, click in zip(moves, clicks):
-        rc, err = _run(move)
+        rc, err = _run(move, env=env)
         if rc != 0:
             continue
-        rc, err = _run(click)
+        rc, err = _run(click, env=env)
         if rc == 0:
             return [{"type": "text", "text": (
                 f"Moved to ({x},{y}) and {button}-clicked ({move[0]})"

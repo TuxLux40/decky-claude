@@ -1289,8 +1289,11 @@ class Plugin:
         """Run the xdotool/ydotool alternatives until one succeeds, reporting
         the last failure if none do."""
         result = {"success": False, "error": "no command to run"}
+        # Aim at the focused window's Xwayland server (a game is often on :1).
+        display = await asyncio.to_thread(deck_common.focused_x_display, self._display_env())
+        env = {"DISPLAY": display} if display else None
         for cmd in cmds:
-            result = await self._run_cmd(cmd)
+            result = await self._run_cmd(cmd, env)
             if result["success"]:
                 return result
         return result
