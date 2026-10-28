@@ -7,6 +7,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import socket
 import struct
 import subprocess
@@ -337,23 +338,65 @@ def _run_first(cmds: list[list[str]]) -> tuple[int, str, str]:
     return rc, err, tool
 
 
-# gamescope's "screenshot" control command is normally invoked with just a
-# path (-> base_plane_only, the game's own frame, no overlays — the same as
-# the controller's physical screenshot button). gamescopectl's CLI only ever
-# forwards argv[1] (the command) and argv[2] (one opaque string) to the
-# compositor, so a second argument has to be smuggled in as extra
-# whitespace-separated tokens inside that one string — gamescope's own
-# "screenshot" console command then re-splits it into <path> <type>, per its
-# `screenshot_type` enum (protocol/gamescope-control.xml):
-#   1 base_plane_only  — game only, no color mgmt applied              (default)
-#   2 all_real_layers  — game + overlays (Steam QAM, notifications), no color mgmt
-#   3 full_composition — every layer, no color mgmt/mura
-#   4 screen_buffer    — the exact on-screen buffer, 1:1 (incl. QAM, color mgmt intact)
+# gamescope's "screenshot" console command (what gamescopectl sends) takes a
+# path and nothing else, and always captures base_plane_only: the game's own
+# frame, no overlays — the same as the controller's physical screenshot
+# button. Anything after the path is taken as part of the filename
+# ("Unsupported extension for a screenshot: .png 4", gamescope 3.17).
+#
+# The other capture types are reachable over X instead: setting
+# GAMESCOPECTRL_DEBUG_REQUEST_SCREENSHOT on Xwayland's root window to a
+# `screenshot_type` value (protocol/gamescope-control.xml) captures with that
+# type to the fixed path /tmp/gamescope.png, then gamescope deletes the
+# property again, so every set triggers a fresh capture.
+#   4 screen_buffer — the exact on-screen buffer, 1:1 (QAM, overlays, color mgmt intact)
 # screen_buffer is what "include Steam UI" asks for: it's what the display is
-# actually showing, cursor and QAM included. Unverified on hardware — the
-# gamescope side of this re-split is inferred from its ConCommand handler,
-# not tested end to end.
+# actually showing. Verified on hardware: the capture includes overlay layers
+# (MangoHud) that the gamescopectl capture of the same frame leaves out.
 _SCREENSHOT_TYPE_SCREEN_BUFFER = 4
+_DEBUG_SCREENSHOT_ATOM = "GAMESCOPECTRL_DEBUG_REQUEST_SCREENSHOT"
+_DEBUG_SCREENSHOT_PATH = "/tmp/gamescope.png"
+
+
+def _wait_for_capture(path: str, previous_mtime_ns: int = 0) -> bool:
+    """Wait for gamescope to finish writing a capture to `path`.
+
+    gamescope writes the file from its own render thread, so it can land
+    slightly after the request returns, and a large PNG can be seen half
+    written. Done means: newer than `previous_mtime_ns` and its size held
+    still across two polls.
+    """
+    last_size = -1
+    for _ in range(30):
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            st = None
+        if st and st.st_mtime_ns != previous_mtime_ns and st.st_size:
+            if st.st_size == last_size:
+                return True
+            last_size = st.st_size
+        time.sleep(0.1)
+    return False
+
+
+def _gamescope_screenshot_with_overlays(path: str) -> str | None:
+    """screen_buffer capture via the X property, copied to `path`."""
+    try:
+        previous = os.stat(_DEBUG_SCREENSHOT_PATH).st_mtime_ns
+    except FileNotFoundError:
+        previous = 0
+    rc, err = _run([
+        "xprop", "-root",
+        "-f", _DEBUG_SCREENSHOT_ATOM, "32c",
+        "-set", _DEBUG_SCREENSHOT_ATOM, str(_SCREENSHOT_TYPE_SCREEN_BUFFER),
+    ])
+    if rc != 0:
+        return err or "xprop failed"
+    if not _wait_for_capture(_DEBUG_SCREENSHOT_PATH, previous):
+        return "gamescope produced no screenshot"
+    shutil.copyfile(_DEBUG_SCREENSHOT_PATH, path)
+    return None
 
 
 def _gamescope_screenshot(path: str, include_steam_ui: bool = False) -> str | None:
@@ -371,19 +414,17 @@ def _gamescope_screenshot(path: str, include_steam_ui: bool = False) -> str | No
     if not env.get("GAMESCOPE_WAYLAND_DISPLAY"):
         return "not running under gamescope — screen capture needs Gaming Mode"
 
-    arg = f"{path} {_SCREENSHOT_TYPE_SCREEN_BUFFER}" if include_steam_ui else path
+    if include_steam_ui:
+        return _gamescope_screenshot_with_overlays(path)
+
     # Outside a live gamescope, gamescopectl still exits 0 after failing to
     # connect, so the file itself is the only trustworthy success signal.
-    rc, err = _run(["gamescopectl", "screenshot", arg], timeout=15)
+    rc, err = _run(["gamescopectl", "screenshot", path], timeout=15)
     if rc != 0:
         return err or "gamescopectl failed"
-    # gamescope writes the file from its own render thread, so it can land
-    # slightly after the command returns.
-    for _ in range(20):
-        if os.path.exists(path) and os.path.getsize(path):
-            return None
-        time.sleep(0.1)
-    return "gamescope produced no screenshot"
+    if not _wait_for_capture(path):
+        return "gamescope produced no screenshot"
+    return None
 
 
 # ── session context (live "where am I running" probe) ──────────────────────────
