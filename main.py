@@ -227,6 +227,21 @@ def _save_setting(key: str, value) -> None:
     os.replace(tmp, path)
 
 
+async def _emit(event: str, *args) -> None:
+    """decky.emit, tolerating its absence and its failures.
+
+    The decky module only exists inside Decky's plugin runtime, and a push the
+    frontend misses is recovered by the panel's own status poll — neither is
+    worth breaking the session code path over.
+    """
+    try:
+        import decky
+
+        await decky.emit(event, *args)
+    except Exception as exc:
+        logger.warning("could not emit %s: %s", event, exc)
+
+
 def _installed_version() -> str:
     try:
         with open(os.path.join(_PLUGIN_DIR, "package.json")) as f:
@@ -447,6 +462,12 @@ class Plugin:
     _session_id: str = ""
     _error_msg: str | None = None
     _not_logged_in: bool = False
+    # Set while stop_session() tears the process down, so the output drain
+    # doesn't mistake a requested stop for the session ending on its own.
+    _stopping: bool = False
+    # Decky tears the event loop down right after _unload, so a push queued
+    # then is never sent and only leaves a "Task was destroyed" warning.
+    _unloading: bool = False
     _log_lines: list[str] = []
     _skill_name: str | None = None
     _skill_link_created: str | None = None
@@ -478,6 +499,7 @@ class Plugin:
         self._log_lines = []
 
     async def _unload(self):
+        self._unloading = True
         await self.cancel_login()
         await self.stop_session()
 
@@ -503,6 +525,7 @@ class Plugin:
         self._not_logged_in = False
         self._status = "starting"
         self._log_lines = []
+        self._publish()
 
         claude_bin = await self._find_claude()
         if not claude_bin:
@@ -510,6 +533,7 @@ class Plugin:
             self._error_msg = (
                 "claude not found. Install via: npm install -g @anthropic-ai/claude-code"
             )
+            self._publish()
             return {"success": False, "error": self._error_msg}
 
         try:
@@ -521,6 +545,7 @@ class Plugin:
                 f"Could not prepare {working_dir}: {exc}. "
                 "Pick a directory you can write to."
             )
+            self._publish()
             return {"success": False, "error": self._error_msg}
         self._trust_working_dir(working_dir)
 
@@ -564,6 +589,7 @@ class Plugin:
             os.close(master_fd)
             self._status = "error"
             self._error_msg = str(exc)
+            self._publish()
             return {"success": False, "error": self._error_msg}
         os.close(slave_fd)
 
@@ -585,6 +611,7 @@ class Plugin:
             if self._process.returncode is not None:
                 self._status = "error"
                 self._error_msg = "Process exited before providing a session URL"
+                self._publish()
                 return {"success": False, "error": self._error_msg}
             await asyncio.sleep(0.5)
 
@@ -600,9 +627,11 @@ class Plugin:
         await self.stop_session()
         self._status = "error"
         self._error_msg = message
+        self._publish()
         return {"success": False, "error": message}
 
     async def stop_session(self):
+        self._stopping = True
         if self._process:
             try:
                 self._process.terminate()
@@ -627,6 +656,8 @@ class Plugin:
         self._error_msg = None
         self._resume_id = ""
         self._session_id = ""
+        self._stopping = False
+        self._publish()
         return {"success": True}
 
     async def get_status(self):
@@ -635,6 +666,9 @@ class Plugin:
             self._session_url = None
             if self._status not in ("stopped", "error"):
                 self._status = "stopped"
+        return self._status_payload()
+
+    def _status_payload(self) -> dict:
         return {
             "status": self._status,
             "url": self._session_url,
@@ -643,6 +677,20 @@ class Plugin:
             "error": self._error_msg,
             "skill": self._skill_name,
         }
+
+    def _publish(self, event: str | None = None) -> None:
+        """Push the session state to the frontend.
+
+        The panel only exists while the Quick Access menu shows it, so it can't
+        be what notices a URL arriving or a session ending after it closed.
+        ``event`` names the transitions the frontend announces with a toast:
+        "ready" (the session is reachable from the Claude app) and "ended"
+        (it stopped without the panel's Stop).
+        """
+        if self._unloading:
+            return
+        payload = dict(self._status_payload(), event=event)
+        asyncio.ensure_future(_emit("session_status", payload))
 
     async def get_log(self):
         return {"lines": self._log_lines[-30:]}
@@ -1385,10 +1433,13 @@ class Plugin:
         """Finding a URL means the session started — any earlier banner line
         that looked like an error (MCP auth notices contain the substring
         "auth") was not fatal and must not stay stuck in the QAM."""
+        first = self._session_url is None
         self._session_url = url
         if self._status == "starting":
             self._status = "running"
         self._error_msg = None
+        if first:
+            self._publish("ready")
 
     async def _drain_output(self):
         loop = asyncio.get_event_loop()
@@ -1441,8 +1492,10 @@ class Plugin:
         except Exception as exc:
             logger.error("drain_output error: %s", exc)
         finally:
-            if self._status == "running":
+            if self._status == "running" and not self._stopping:
                 self._status = "stopped"
+                self._session_url = None
+                self._publish("ended")
 
     # ── settings API ───────────────────────────────────────────────────────────
 

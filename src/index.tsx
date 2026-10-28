@@ -8,7 +8,7 @@ import {
   staticClasses,
   TextField,
 } from "@decky/ui";
-import { callable, definePlugin } from "@decky/api";
+import { addEventListener, callable, definePlugin, removeEventListener, toaster } from "@decky/api";
 import { useEffect, useMemo, useState } from "react";
 import { FaTerminal } from "react-icons/fa";
 import qrcode from "qrcode-generator";
@@ -22,17 +22,15 @@ const startSession = callable<
   { success: boolean; url?: string; error?: string }
 >("start_session");
 const stopSession = callable<[], { success: boolean }>("stop_session");
-const getStatus = callable<
-  [],
-  {
-    status: string;
-    url?: string;
-    working_dir: string;
-    resume_id?: string;
-    error?: string;
-    skill?: string | null;
-  }
->("get_status");
+interface StatusSnapshot {
+  status: string;
+  url?: string;
+  working_dir: string;
+  resume_id?: string;
+  error?: string;
+  skill?: string | null;
+}
+const getStatus = callable<[], StatusSnapshot>("get_status");
 const listDirs = callable<[], { dirs: string[] }>("list_dirs");
 
 const sendKey = callable<[string], { success: boolean; error?: string }>("send_key");
@@ -139,6 +137,29 @@ function useChoice(key: Choice): [string, (next: string | ((cur: string) => stri
   return [value, set];
 }
 
+// The backend pushes every session transition (`_publish` in main.py). The
+// listener lives at plugin scope, not in the panel: the panel only exists while
+// the Quick Access menu shows it, and the URL arriving or a session ending
+// mostly happens after it closed. Mounted panels follow the latest snapshot;
+// their slower poll only covers a push that got lost.
+const SESSION_STATUS_EVENT = "session_status";
+let latestStatus: StatusSnapshot | null = null;
+const statusListeners = new Set<(s: StatusSnapshot) => void>();
+
+function publishStatus(s: StatusSnapshot) {
+  latestStatus = s;
+  statusListeners.forEach((l) => l(s));
+}
+
+function onSessionStatus(s: StatusSnapshot & { event?: "ready" | "ended" | null }) {
+  publishStatus(s);
+  if (s.event === "ready") {
+    toaster.toast({ title: "Claude Code", body: "Session ready — open it in the Claude app." });
+  } else if (s.event === "ended") {
+    toaster.toast({ title: "Claude Code", body: "The Claude session ended." });
+  }
+}
+
 /** QR as a single scaled bitmap.
  *
  *  An OAuth URL is ~450 chars, which needs a 73x73 matrix — rendering that as
@@ -223,8 +244,14 @@ function Content() {
   }, []);
 
   useEffect(() => {
-    const id = setInterval(syncStatus, 3000);
-    return () => clearInterval(id);
+    statusListeners.add(applyStatus);
+    if (latestStatus) applyStatus(latestStatus);
+    // Fallback only — transitions arrive as pushes (see publishStatus).
+    const id = setInterval(syncStatus, 10000);
+    return () => {
+      statusListeners.delete(applyStatus);
+      clearInterval(id);
+    };
   }, []);
 
   useEffect(() => {
@@ -308,26 +335,29 @@ function Content() {
 
   async function syncStatus() {
     try {
-      const r = await getStatus();
-      const next = parseStatus(r.status);
-      if (next) {
-        setStatus(next);
-        // Mirror the backend's error exactly, including clearing it once the
-        // backend has — otherwise a resolved/stale error sticks in the panel
-        // forever since this poll never ran the "clear" branch.
-        setSessionError(r.error ?? null);
-      } else {
-        setStatus("error");
-        setSessionError(`Backend reported an unknown status: ${String(r.status)}`);
-      }
-      setSessionUrl(r.url ?? null);
-      setSkill(r.skill ?? null);
-      // A session started before the panel was opened still has to show what it
-      // is resuming, so the backend's value wins while one is running.
-      if (next === "running" || next === "starting") setResumeId(r.resume_id ?? "");
+      publishStatus(await getStatus());
     } catch (e) {
       logPollFailure(e);
     }
+  }
+
+  function applyStatus(r: StatusSnapshot) {
+    const next = parseStatus(r.status);
+    if (next) {
+      setStatus(next);
+      // Mirror the backend's error exactly, including clearing it once the
+      // backend has — otherwise a resolved/stale error sticks in the panel
+      // forever.
+      setSessionError(r.error ?? null);
+    } else {
+      setStatus("error");
+      setSessionError(`Backend reported an unknown status: ${String(r.status)}`);
+    }
+    setSessionUrl(r.url ?? null);
+    setSkill(r.skill ?? null);
+    // A session started before the panel was opened still has to show what it
+    // is resuming, so the backend's value wins while one is running.
+    if (next === "running" || next === "starting") setResumeId(r.resume_id ?? "");
   }
 
   // ── session ──
@@ -732,6 +762,7 @@ function Content() {
 export default definePlugin(() => {
   initSidebarTab(<Content />);
   const stopAutoUpdate = startAutoUpdate();
+  addEventListener(SESSION_STATUS_EVENT, onSessionStatus);
   return {
     name: "Claude Code",
     title: <div className={staticClasses.Title}>Claude Code</div>,
@@ -740,6 +771,7 @@ export default definePlugin(() => {
     onDismount() {
       disposeSidebarTab();
       stopAutoUpdate();
+      removeEventListener(SESSION_STATUS_EVENT, onSessionStatus);
     },
   };
 });
