@@ -25,8 +25,9 @@ Tap **Start Remote Session** in the Quick Access menu, open the link in the Clau
 |---|---|
 | **Phone-controlled Claude Code** | The plugin starts `claude --remote-control` in a working directory you pick and shows the session link. Open it in the Claude app and drive the session from your phone. |
 | **Steam UI debugger** | Steam's Gaming Mode UI is embedded Chromium with a DevTools debugger on `localhost:8080`. Claude runs JavaScript inside it (`steam_ui_eval`), reads real client state — downloads, library, login, settings — and triggers real actions instead of hunting for pixels. |
-| **Eyes and hands** | `screenshot` shows Claude what's on screen; `send_key`, `type_text` and `mouse_move_click` press keys and click. |
+| **Eyes and hands** | `screenshot` shows Claude what's on screen; `send_key`, `type_text` and `mouse_move_click` press keys and click. Keys are held briefly so games, which read input once per frame, register them. |
 | **Always-loaded debugging skill** | The [steam-debugger skill](https://github.com/TuxLux40/skills) (workflow, log locations, safe-fix rules, per-topic references) is injected into every session's system prompt — on start and on resume. |
+| **Learns from every session** | What Claude finds while debugging your machine (fixes that worked, dead ends, game quirks) is written to a local learnings file. The next session reads it first, so the same problem isn't solved from scratch twice. |
 | **Keeps itself up to date** | Checks GitHub for new releases and installs them through Decky's own installer. |
 
 In-game help (asking Claude about the game you're playing) uses the same tools; the tooling is tuned for Steam debugging.
@@ -59,7 +60,7 @@ flowchart LR
     mcp -- "send_key / type_text / click" --> input
 ```
 
-Everything written into the working directory (`.mcp.json`, the `CLAUDE.md` block, the skill link) is removed when the session stops. `mcp_server.py` is stdlib-only Python: no pip dependencies, no daemon, no open ports — it only lives as a child of the Claude session.
+Everything written into the working directory (`.mcp.json`, the `CLAUDE.md` block, the skill link) is removed when the session stops. The one thing meant to outlast a session is the [learnings file](#learning-loop). `mcp_server.py` is stdlib-only Python: no pip dependencies, no daemon, no open ports — it only lives as a child of the Claude session.
 
 ### MCP tools
 
@@ -152,6 +153,30 @@ pnpm build
 ```
 
 Copy `dist/`, `skills/`, `main.py`, `mcp_server.py`, `deck_common.py`, `machine_profile.py`, `plugin.json` and `package.json` to `~/homebrew/plugins/decky-claude/` and restart Decky Loader. Copy `skills/` with `cp -rL` — it's a symlink into the submodule. Don't symlink the plugin folder itself to a checkout: Decky changes ownership of whatever it points to.
+
+</details>
+
+## Learning loop
+
+Every session runs with the steam-debugger skill's learning-loop hook, so the plugin gets better on *your* machine the more you use it:
+
+- **At the start**, Claude is pointed at `~/.local/share/steam-debugger/learnings.md` and checks it for your symptom before diagnosing from scratch.
+- **While it works**, after a stretch of debugging, a hook asks Claude to write down what it learned: one short entry per finding, with the context, what happened, the evidence, and a status of *confirmed* (you said it works), *observed* (Claude saw it in logs or output) or *unverified*. Claude is told to record only what actually happened in the session, never guesses dressed up as facts.
+
+```markdown
+## 2026-10-31 — Character can't walk after injected keys
+- Context: Resident Evil 4 (2005, appid 254700), Proton 11.0, Gaming Mode
+- Finding: an xdotool keyup sweep on the game's display fixed it at once
+- Status: confirmed
+- Evidence: DISPLAY=:1 xdotool keyup Shift_L … ; user: "can walk again"
+```
+
+The file is plain Markdown and stays on your machine; nothing is uploaded. Read it, edit it, or delete it to start over. You don't set anything up and it survives plugin updates and session cleanup.
+
+<details>
+<summary><b>For skill maintainers</b></summary>
+
+If `~/.config/steam-debugger/repo` contains the path of the skill directory in a writable git checkout of [TuxLux40/skills](https://github.com/TuxLux40/skills), sessions also promote findings that are confirmed and true beyond one machine into the skill's reference files and push them. That's how fixes found on one machine reach every user through the next release. Without that file, everything stays local. The hook itself is [`scripts/learning-loop.py`](https://github.com/TuxLux40/skills/blob/master/skills/steam-debugger/scripts/learning-loop.py) in the skill; its docstring shows how to wire it into plain Claude Code sessions outside the plugin.
 
 </details>
 
