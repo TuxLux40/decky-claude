@@ -7,6 +7,7 @@ import os
 import pty
 import pwd
 import re
+import shlex
 import sys
 import termios
 import uuid
@@ -564,6 +565,9 @@ class Plugin:
         preload = self._write_skill_preload()
         if preload:
             argv += ["--append-system-prompt-file", preload]
+        hooks = self._learning_loop_settings()
+        if hooks:
+            argv += ["--settings", hooks]
         if resume_id:
             argv += ["--resume", resume_id]
             self._session_id = resume_id
@@ -1164,6 +1168,21 @@ class Plugin:
                     if os.path.isfile(os.path.join(path, "SKILL.md")):
                         return path
         return None
+
+    def _learning_loop_settings(self) -> str | None:
+        """--settings JSON wiring the skill's learning-loop hook, so each session
+        records what it learned in the user's local learnings file (the skill
+        script's docstring has the details); None if the skill lacks it."""
+        src = self._find_steam_debugger_skill()
+        script = os.path.join(os.path.realpath(src), "scripts", "learning-loop.py") if src else ""
+        if not os.path.isfile(script):
+            return None
+
+        def hook(event: str) -> list[dict]:
+            cmd = f"python3 {shlex.quote(script)} {event}"
+            return [{"hooks": [{"type": "command", "command": cmd, "timeout": 10}]}]
+
+        return json.dumps({"hooks": {"SessionStart": hook("session-start"), "Stop": hook("stop")}})
 
     def _write_skill_preload(self) -> str | None:
         """Compose SKILL.md (minus frontmatter) with absolute reference paths

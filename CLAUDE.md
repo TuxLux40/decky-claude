@@ -25,6 +25,10 @@ Gaming Mode / Big Picture UI. Everything must work out of the box:
   own installer. Don't break the version/sha256 contract in `src/update.tsx`.
 - The skill is the `vendor/skills` submodule; `skills/steam-debugger` is a
   symlink dereferenced at packaging time.
+- Every session gets the skill's learning-loop hook via `--settings`
+  (`_learning_loop_settings`): findings go to the user's local
+  `~/.local/share/steam-debugger/learnings.md`. Only a machine with
+  `~/.config/steam-debugger/repo` promotes into the skill repo.
 
 ## Synthetic input (`deck_common.key_commands` and friends)
 
