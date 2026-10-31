@@ -152,7 +152,15 @@ def normalize_button(button: str | int) -> str:
     return button if button in _XDOTOOL_BUTTONS else "left"
 
 
-def key_commands(key: str) -> list[list[str]]:
+# Games sample input once per frame (RE4 at 30 Hz), so a press and release sent
+# back to back usually lands between two samples and is never seen. 120 ms
+# spans several frames yet stays well under X's ~250 ms autorepeat delay, so
+# Steam's UI and text fields still get exactly one keystroke.
+DEFAULT_KEY_HOLD_MS = 120
+MAX_KEY_HOLD_MS = 5000
+
+
+def key_commands(key: str, hold_ms: int = DEFAULT_KEY_HOLD_MS) -> list[list[str]]:
     """xdotool first, ydotool second — try each until one exits 0.
 
     ydotool only works with a running ydotoold and access to /dev/uinput, so it
@@ -162,11 +170,23 @@ def key_commands(key: str) -> list[list[str]]:
     name — a bare name is a "non-interpretable value" that ydotool silently
     treats as a no-op delay while still exiting 0, so this must send an
     explicit press (":1") then release (":0") or nothing happens at all.
+
+    `hold_ms` keeps the key down between press and release; 0 is an instant
+    tap. xdotool does the hold in one process via command chaining
+    (keydown … sleep … keyup), ydotool via its delay between key events.
     """
     code = ydotool_key(key)
+    hold_ms = max(0, min(int(hold_ms), MAX_KEY_HOLD_MS))
+    if hold_ms == 0:
+        return [
+            ["xdotool", "key", "--clearmodifiers", "--", key],
+            ["ydotool", "key", "--", f"{code}:1", f"{code}:0"],
+        ]
     return [
-        ["xdotool", "key", "--clearmodifiers", "--", key],
-        ["ydotool", "key", "--", f"{code}:1", f"{code}:0"],
+        ["xdotool", "keydown", "--clearmodifiers", "--", key,
+         "sleep", f"{hold_ms / 1000:g}",
+         "keyup", "--clearmodifiers", "--", key],
+        ["ydotool", "key", "-d", str(hold_ms), "--", f"{code}:1", f"{code}:0"],
     ]
 
 

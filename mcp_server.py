@@ -258,12 +258,22 @@ TOOLS = [
         "description": (
             "Send a key press to the focused application. "
             "key = xdotool key name, e.g. 'escape', 'Return', 'space', "
-            "'Tab', 'F1'–'F12', 'ctrl+c', 'alt+F4'."
+            "'Tab', 'F1'–'F12', 'ctrl+c', 'alt+F4'. The key is held for "
+            "hold_ms before release, because games read input once per frame "
+            "and miss an instant tap; raise it if a game still ignores keys."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "key": {"type": "string", "description": "xdotool key name"}
+                "key": {"type": "string", "description": "xdotool key name"},
+                "hold_ms": {
+                    "type": "integer",
+                    "description": (
+                        "Milliseconds to hold the key down (0 = instant tap, "
+                        f"max {deck_common.MAX_KEY_HOLD_MS})."
+                    ),
+                    "default": deck_common.DEFAULT_KEY_HOLD_MS,
+                },
             },
             "required": ["key"],
         },
@@ -610,10 +620,10 @@ def _input_env() -> dict[str, str]:
     return deck_common.input_env(_display_env())
 
 
-def _handle_send_key(key: str) -> list[dict]:
-    rc, err, tool = _run_first(deck_common.key_commands(key), _input_env())
+def _handle_send_key(key: str, hold_ms: int = deck_common.DEFAULT_KEY_HOLD_MS) -> list[dict]:
+    rc, err, tool = _run_first(deck_common.key_commands(key, hold_ms), _input_env())
     if rc == 0:
-        return [{"type": "text", "text": f"Key sent: {key} ({tool})"}]
+        return [{"type": "text", "text": f"Key sent: {key}, held {hold_ms} ms ({tool})"}]
     return [{"type": "text", "text": f"send_key failed for {key!r}: {err}{_input_hint()}"}]
 
 
@@ -881,7 +891,11 @@ def _dispatch(name: str, args: dict) -> list[dict]:
     if name == "screenshot":
         return _handle_screenshot(bool(args.get("include_steam_ui", False)))
     if name == "send_key":
-        return _handle_send_key(_require_str(name, args, "key"))
+        hold_ms = args.get("hold_ms", deck_common.DEFAULT_KEY_HOLD_MS)
+        if not isinstance(hold_ms, int) or isinstance(hold_ms, bool) or hold_ms < 0:
+            raise _ToolError(f"{name}: argument 'hold_ms' must be a non-negative integer (got {hold_ms!r})")
+        hold_ms = min(hold_ms, deck_common.MAX_KEY_HOLD_MS)
+        return _handle_send_key(_require_str(name, args, "key"), hold_ms)
     if name == "type_text":
         return _handle_type_text(_require_str(name, args, "text"))
     if name == "mouse_move_click":
