@@ -174,6 +174,10 @@ def key_commands(key: str, hold_ms: int = DEFAULT_KEY_HOLD_MS) -> list[list[str]
     `hold_ms` keeps the key down between press and release; 0 is an instant
     tap. xdotool does the hold in one process via command chaining
     (keydown … sleep … keyup), ydotool via its delay between key events.
+    The hold path leaves out --clearmodifiers: it releases and re-presses the
+    user's modifiers around each subcommand, and those extra synthetic events
+    are the prime suspect for a key that RE4 under Wine kept seeing as held
+    (Ashley couldn't walk until a manual `xdotool keyup`).
     """
     code = ydotool_key(key)
     hold_ms = max(0, min(int(hold_ms), MAX_KEY_HOLD_MS))
@@ -183,9 +187,9 @@ def key_commands(key: str, hold_ms: int = DEFAULT_KEY_HOLD_MS) -> list[list[str]
             ["ydotool", "key", "--", f"{code}:1", f"{code}:0"],
         ]
     return [
-        ["xdotool", "keydown", "--clearmodifiers", "--", key,
+        ["xdotool", "keydown", "--", key,
          "sleep", f"{hold_ms / 1000:g}",
-         "keyup", "--clearmodifiers", "--", key],
+         "keyup", "--", key],
         ["ydotool", "key", "-d", str(hold_ms), "--", f"{code}:1", f"{code}:0"],
     ]
 
